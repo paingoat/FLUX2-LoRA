@@ -54,7 +54,28 @@ cd /workspace/FLUX2-LoRA
 
 Branch mới chỉ chứa code, mapping, metadata và caption. Ảnh, cache, env, checkpoint và samples không đi theo Git. Dùng shallow clone như trên để không tải lịch sử commit cũ từng chứa ảnh. Nếu repo private, xác thực bằng SSH key hoặc credential manager; không ghi token trực tiếp trong URL.
 
-## 4. Upload dataset riêng
+## 4. Lấy dataset trên Pod
+
+### Cách A: tải từ Hugging Face (khuyến nghị)
+
+Dataset private: [Thoandanh/flux2-klein-removal-dual](https://huggingface.co/datasets/Thoandanh/flux2-klein-removal-dual).
+
+Không cần upload archive bằng WinSCP. Chạy setup ở bước 5 trước để có lệnh `hf`. Sau khi activate env `klein`, chạy các lệnh sau **trước** `prepare_dataset.py`:
+
+```bash
+cd /workspace/FLUX2-LoRA
+read -rsp "HF read token: " HF_TOKEN
+printf '\n'
+export HF_TOKEN
+hf download Thoandanh/flux2-klein-removal-dual \
+  --repo-type dataset --local-dir data/removal_dataset
+```
+
+Nhập token có quyền đọc repo private này; nội dung không hiện trên màn hình và không đi vào shell history. Nếu mạng rớt, vào lại screen rồi chạy lại cùng lệnh `hf download`; client tái sử dụng cache/file đã tải. Nếu process download vẫn chạy thì chờ nó, không mở thêm lượt tải.
+
+Token dùng upload đã được gửi qua chat nên cần revoke sau khi upload xong, rồi dùng token read mới trên Pod. Không ghi token vào Git hoặc vào lệnh có token literal.
+
+### Cách B: upload archive qua SCP/SFTP
 
 Máy local đã có bộ original/reference/target được mapping. Tạo archive từ gốc repo local:
 
