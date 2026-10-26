@@ -144,13 +144,9 @@ conda activate klein-infer
 python core/app.py
 ```
 
-App nghe `0.0.0.0:7860`. Từ máy local:
+App nghe `0.0.0.0:7860` và bật Gradio `share`, nên log in một URL public dạng `https://....gradio.live`. Mở URL đó từ máy bất kỳ; không cần SSH tunnel. Link share sống khoảng 72 giờ và hết hạn khi process dừng.
 
-```bash
-ssh -L 7860:127.0.0.1:7860 <user>@<pod>
-```
-
-Mở `http://127.0.0.1:7860`.
+Trên pod, `http://<pod-ip>:7860` vẫn dùng được nếu cổng 7860 được mở.
 
 Tab **Scribble & Remove**: upload ảnh, vẽ vòng tròn đỏ, bấm Remove. Slider hiện ảnh trước và sau. Prompt bị khóa đúng một câu đã train. Sidebar chọn checkpoint, LoRA scale, số step, guidance và seed. Pipeline mặc định là distilled 4 step; chuyển sang base sẽ đẩy số step lên 50.
 
