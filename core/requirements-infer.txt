@@ -1,0 +1,17 @@
+git+https://github.com/huggingface/diffusers.git
+peft==0.18.1
+gradio
+transformers
+accelerate
+lpips
+scikit-image
+opencv-python-headless
+hf_transfer
+huggingface_hub
+python-dotenv
+pillow
+numpy
+tqdm
+safetensors
+sentencepiece
+protobuf
