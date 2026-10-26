@@ -1,7 +1,7 @@
 ---
 job: extension
 config:
-  name: "removal_scribble_4b"
+  name: "removal_dual_4b"
   process:
     - type: sd_trainer
       training_folder: "/workspace/output"
@@ -16,8 +16,9 @@ config:
         max_step_saves_to_keep: 6
         push_to_hub: false
       datasets:
-        - folder_path: "/workspace/datasets/removal_scribble/target"
-          control_path: "/workspace/datasets/removal_scribble/reference"
+        - folder_path: "/workspace/datasets/removal_dual/target"
+          control_path_1: "/workspace/datasets/removal_dual/original"
+          control_path_2: "/workspace/datasets/removal_dual/reference"
           caption_ext: "txt"
           caption_dropout_rate: 0.05
           shuffle_tokens: false
@@ -39,6 +40,8 @@ config:
         name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
         arch: "flux2_klein_4b"
         quantize_te: true
+        model_kwargs:
+          match_target_res: true
       sample:
         sampler: "flowmatch"
         sample_every: 250
@@ -50,11 +53,19 @@ config:
         walk_seed: false
         guidance_scale: 4
         sample_steps: 20
-        prompts:
-          - "Remove the object inside the red circle and naturally restore the background. --ctrl_img /workspace/datasets/removal_scribble/sample_controls/0015.png"
-          - "Remove the object inside the red circle and naturally restore the background. --ctrl_img /workspace/datasets/removal_scribble/sample_controls/0022.png"
-          - "Remove the object inside the red circle and naturally restore the background. --ctrl_img /workspace/datasets/removal_scribble/sample_controls/0040.png"
-          - "Remove the object inside the red circle and naturally restore the background. --ctrl_img /workspace/datasets/removal_scribble/sample_controls/0057.png"
+        samples:
+          - prompt: &removal_prompt "Image 1 is the original image to edit. Image 2 is the same image with annotations indicating the edit. Use image 1 as the source and image 2 as spatial guidance. Do not reproduce the annotation strokes in the output. Preserve content outside the requested edit. Editing instruction: Remove the object inside the red circle and naturally restore the background."
+            ctrl_img_1: "/workspace/datasets/removal_dual/sample_controls/0015_original.png"
+            ctrl_img_2: "/workspace/datasets/removal_dual/sample_controls/0015.png"
+          - prompt: *removal_prompt
+            ctrl_img_1: "/workspace/datasets/removal_dual/sample_controls/0022_original.png"
+            ctrl_img_2: "/workspace/datasets/removal_dual/sample_controls/0022.png"
+          - prompt: *removal_prompt
+            ctrl_img_1: "/workspace/datasets/removal_dual/sample_controls/0040_original.png"
+            ctrl_img_2: "/workspace/datasets/removal_dual/sample_controls/0040.png"
+          - prompt: *removal_prompt
+            ctrl_img_1: "/workspace/datasets/removal_dual/sample_controls/0057_original.png"
+            ctrl_img_2: "/workspace/datasets/removal_dual/sample_controls/0057.png"
 meta:
   name: "[name]"
   version: "1.0"

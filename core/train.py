@@ -23,6 +23,8 @@ from common import (
     BASE_REPO,
     OUTPUT_DIR,
     PREPARED_DIR,
+    PROMPT,
+    REFERENCE_ORDER,
     TEXT_ENCODER_REPO,
     TRAIN_CONFIG,
     TRANSFORMER_FILE,
@@ -36,8 +38,6 @@ from common import (
 STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 LOSS_RE = re.compile(r"\bloss:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
 SAVE_RE = re.compile(r"Saving at step\s+(\d+)")
-PATH_RE = re.compile(r"(?:folder_path|control_path):\s*\"([^\"]+)\"")
-CTRL_RE = re.compile(r"--ctrl_img\s+([^\s\"]+)")
 FIELD_RE = re.compile(r"(?m)^\s*(steps|save_every):\s*(\d+)\s*$")
 
 
@@ -49,10 +49,19 @@ def config_numbers(text: str) -> dict[str, int]:
 
 
 def config_paths(text: str) -> list[Path]:
-    paths = [Path(item) for item in PATH_RE.findall(text)]
-    paths.extend(Path(item) for item in CTRL_RE.findall(text))
-    if len(paths) < 2:
-        raise SystemExit(f"{TRAIN_CONFIG} is missing folder_path or control_path")
+    import yaml
+
+    process = yaml.safe_load(text)["config"]["process"][0]
+    paths = []
+    for dataset in process["datasets"]:
+        for key in ("folder_path", "control_path_1", "control_path_2"):
+            if not dataset.get(key):
+                raise SystemExit(f"two-input training requires {key}")
+            paths.append(Path(dataset[key]))
+    for sample in process["sample"]["samples"]:
+        if sample["prompt"] != PROMPT:
+            raise SystemExit("preview prompt differs from training prompt")
+        paths.extend(Path(sample[key]) for key in ("ctrl_img_1", "ctrl_img_2"))
     return paths
 
 
@@ -60,7 +69,10 @@ def require_ready(config_text: str) -> None:
     card = PREPARED_DIR / "dataset_card.json"
     if not card.is_file():
         raise SystemExit(f"missing {card}. Run core/prepare_dataset.py on the pod first.")
-    source = assert_not_old_removal(Path(json.loads(card.read_text(encoding="utf-8"))["source"]))
+    metadata = json.loads(card.read_text(encoding="utf-8"))
+    if metadata.get("reference_order") != REFERENCE_ORDER or metadata.get("prompt") != PROMPT:
+        raise SystemExit("dataset is not prepared for two inputs; run prepare_dataset.py again")
+    source = assert_not_old_removal(Path(metadata["source"]))
     print(f"dataset source: {source}")
 
     for path in config_paths(config_text):
@@ -81,12 +93,18 @@ def require_ready(config_text: str) -> None:
     run_py = AITOOLKIT_DIR / "run.py"
     if not run_py.is_file():
         raise SystemExit(f"missing {run_py}. Run core/setup.sh first.")
+    toolkit_config = AITOOLKIT_DIR / "toolkit" / "config_modules.py"
+    if not toolkit_config.is_file() or not all(
+        token in toolkit_config.read_text(encoding="utf-8")
+        for token in ("control_path_1", "control_path_2", "ctrl_img_2", "class SampleItem")
+    ):
+        raise SystemExit("ai-toolkit is too old for this multi-reference config; update it first")
 
 
-def existing_checkpoints() -> list[Path]:
-    if not OUTPUT_DIR.is_dir():
+def existing_checkpoints(output: Path = OUTPUT_DIR) -> list[Path]:
+    if not output.is_dir():
         return []
-    return sorted(OUTPUT_DIR.glob("*.safetensors"))
+    return sorted(output.glob("*.safetensors"))
 
 
 def parse_trainer_line(line: str) -> dict[str, int | float] | None:
@@ -147,14 +165,32 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=TRAIN_CONFIG)
     parser.add_argument("--resume", action="store_true", help="continue from the latest checkpoint in the output folder")
+    parser.add_argument("--smoke-steps", type=int, help="short GPU run in a separate _smoke output directory")
+    parser.add_argument("--check-only", action="store_true", help="validate data/config/toolkit/weights without starting training")
     args = parser.parse_args()
 
     load_runtime_env()
     config_text = args.config.read_text(encoding="utf-8")
+    import yaml
+    config = yaml.safe_load(config_text)
+    if args.smoke_steps is not None:
+        if args.smoke_steps < 1 or args.resume:
+            parser.error("--smoke-steps must be positive and cannot be combined with --resume")
+        config["config"]["name"] += "_smoke"
+        process_config = config["config"]["process"][0]
+        process_config["train"]["steps"] = args.smoke_steps
+        process_config["save"]["save_every"] = args.smoke_steps
+        process_config["sample"]["sample_every"] = args.smoke_steps
+        config_text = yaml.safe_dump(config, sort_keys=False)
+    process_config = config["config"]["process"][0]
+    output_dir = Path(process_config["training_folder"]) / config["config"]["name"]
     numbers = config_numbers(config_text)
     require_ready(config_text)
+    if args.check_only:
+        print(f"ready: {output_dir}")
+        return 0
 
-    checkpoints = existing_checkpoints()
+    checkpoints = existing_checkpoints(output_dir)
     if checkpoints and not args.resume:
         print("checkpoints already exist:", file=sys.stderr)
         for path in checkpoints:
@@ -168,11 +204,15 @@ def main() -> int:
     if not python.is_file():
         raise SystemExit(f"missing trainer python: {python}. Run core/setup.sh and use the klein env.")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = OUTPUT_DIR / "train.log"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_path = args.config.resolve()
+    if args.smoke_steps is not None:
+        config_path = output_dir / "smoke_config.yaml"
+        config_path.write_text(config_text, encoding="utf-8")
+    log_path = output_dir / "train.log"
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    command = [str(python), "run.py", str(args.config.resolve())]
+    command = [str(python), "run.py", str(config_path)]
     print(" ".join(command))
     process = subprocess.Popen(
         command,

@@ -1,177 +1,154 @@
-# Huấn luyện EditLoRA xóa vật thể trong vòng tròn đỏ
+# EditLoRA removal với hai input
 
-Mục tiêu: một LoRA cho `FLUX.2-klein-base-4B`, học xóa vật thể nằm trong vòng tròn đỏ và xóa luôn vòng tròn. Inference dùng bản distilled `FLUX.2-klein-4B`.
+Lần đầu dùng RunPod: đọc [chọn template, screen, upload và reconnect](runpod.md) trước. Repo Git chỉ chứa code/metadata; ảnh dataset upload riêng bằng archive tạo bởi `core/package_dataset.py`.
 
-Nguồn ảnh duy nhất là `data/removal_dataset`:
+Model luôn nhận `[original, reference]`: original là ảnh gốc sạch vẫn còn vật thể; reference là cùng ảnh đó có vòng tròn/nét chỉ dẫn. Target là ảnh sau khi xóa. Thứ tự và phần giải thích vai trò hai ảnh giống nhau ở train, preview, benchmark và Gradio.
 
-- `reference/` là ảnh có vòng tròn đỏ.
-- `target/` là ảnh đã xóa vật thể và vòng tròn.
-- Mọi caption là một câu: `Remove the object inside the red circle and naturally restore the background.`
+Train: `FLUX.2-klein-base-4B`, rank/alpha 32, resolution 512, LR 1e-4, 1500 steps, batch 1 và accumulation 4. Inference mặc định: distilled `FLUX.2-klein-4B`, 4 steps, guidance 4, seed 42. Preview trong lúc train dùng base, 20 steps, không phải cấu hình benchmark distilled.
 
-`data/removal` là tập cũ (nét hatch, box, cross). Không upload tập đó lên pod và không trỏ train vào đó. `prepare_dataset.py` và `train.py` sẽ dừng nếu một path resolve vào thư mục tên `removal`.
+## 1. Mapping original và chuẩn bị dữ liệu
 
-`data/removal_dataset/mask/` và `scribble_style` trong `meta.jsonl` mô tả nét của tập cũ, không trùng vòng tròn đỏ. Train và benchmark không đọc chúng. `meta.jsonl` chỉ được dùng để lấy cột `split` (85 train / 7 validation / 8 test).
-
-Làm lần lượt trên pod. Không cần GPU để chạy `prepare_dataset.py`.
-
-## 1. Pod và token
-
-Tạo file `.env` ở gốc repo, cùng cấp với `core/`:
+Chạy từ gốc repo (thư mục chứa `core/`, `data/`, `samples/`):
 
 ```bash
-cp .env.example .env
+python core/prepare_dataset.py --originals-root samples/remove
 ```
 
-Điền `HF_TOKEN`. Weight trong thí nghiệm này là public; token dùng để tránh bị Hub giới hạn tốc độ tải.
+`mapping.csv` nối `index` với `sample_id`. Script lấy `samples/remove/<sample_id>/original.png`, kiểm tra kích thước và tỷ lệ khác biệt với reference, rồi ghi vào `data/removal_dataset/original/<index>.png`. Giữ nguyên reference vòng tròn đỏ, target và caption nguồn; caption trong thư mục train được tạo bằng prompt hai input thống nhất.
 
-Repo trên pod có thể nằm ở bất kỳ đâu. Các đường dẫn cache, conda, ai-toolkit, dataset đã chuẩn bị và checkpoint đều nằm dưới `/workspace`.
+Kiểm tra alignment là kiểm tra thô: tỷ lệ pixel khác >8 phải trong (0, 12%]. Không thay thế xem ảnh trực quan. `mask/` và scribble_style cũ không được dùng làm vùng edit.
 
-## 2. Setup
-
-```bash
-bash core/setup.sh
-```
-
-Script này:
-
-1. Tạo `/workspace/data` và trỏ `HF_HOME` vào đó. Bật `HF_HUB_ENABLE_HF_TRANSFER=1` và tắt Xet.
-2. Cài Miniconda vào `/workspace/miniconda3` nếu chưa có.
-3. Clone `ostris/ai-toolkit` vào `/workspace/ai-toolkit` trước khi cài dependency của nó.
-4. Tạo env `klein` (Python 3.12): PyTorch 2.13.0 cu130, rồi `ai-toolkit/requirements.txt`.
-5. Tạo env `klein-infer`: cùng bản PyTorch, cộng diffusers mới từ git, `peft==0.18.1`, Gradio, LPIPS, scikit-image, OpenCV.
-6. Tải `FLUX.2-klein-base-4B` (file transformer), `ai-toolkit/flux2_vae`, `Qwen/Qwen3-4B`, và `FLUX.2-klein-4B`.
-
-Chạy lại `setup.sh` sẽ bỏ qua bước đã xong. Xóa `/workspace/data/.klein-requirements-ok` hoặc `/workspace/data/.klein-infer-requirements-ok` nếu muốn cài lại package.
-
-## 3. Dataset
-
-Đưa cả repo, gồm `data/removal_dataset`, lên pod. Không cần `data/removal`.
+Sau khi mapping trên máy local, có thể chỉ upload `data/removal_dataset` lên pod. Trên pod chạy lại để tạo manifest với đường dẫn của pod:
 
 ```bash
-source /workspace/miniconda3/etc/profile.d/conda.sh
-source core/env.sh
 python core/prepare_dataset.py
 ```
 
-Script chỉ đọc `reference/`, `target/`, `mapping.csv` và cột `split` của `meta.jsonl`. Nó ghi ra `/workspace/datasets/removal_scribble/`:
+Output mặc định `/workspace/datasets/removal_dual/`:
 
-- `reference/` và `target/`: 85 cặp train. File `.txt` được copy nguyên.
-- `sample_controls/`: 4 ảnh validation (`0015`, `0022`, `0040`, `0057`) để ai-toolkit vẽ preview. Chúng không nằm trong folder train.
-- `eval/manifest.json`: 15 mẫu validation + test, path trỏ về `removal_dataset` trên pod.
-- `dataset_card.json`: số mẫu, câu prompt, path nguồn.
+- `original/`, `reference/`, `target/`: 85 mẫu train, cùng tên stem.
+- `sample_controls/`: hai input cho 4 mẫu validation (`0015`, `0022`, `0040`, `0057`).
+- `eval/manifest.json`: 7 validation + 8 test. Không có ảnh held-out trong folder train.
+- `dataset_card.json`: thứ tự reference, prompt, split và thống kê alignment.
 
-Chạy `prepare_dataset.py` trên pod. Manifest ghi path tuyệt đối của máy đang chạy.
-
-Kỳ vọng in ra: `counts` gồm train 85, validation 7, test 8.
-
-## 4. Train
+Kiểm tra local không cần GPU:
 
 ```bash
+python core/prepare_dataset.py --originals-root samples/remove --output .local/removal_dual
+```
+
+## 2. Setup và train trên pod
+
+Tạo `.env` theo `.env.example`, điền HF_TOKEN nếu cần, rồi:
+
+```bash
+bash core/setup.sh
+source /workspace/miniconda3/etc/profile.d/conda.sh
 source core/env.sh
 conda activate klein
+python core/train.py --check-only
+python core/train.py --smoke-steps 2
+```
+
+Wrapper kiểm tra AI Toolkit có hỗ trợ `control_path_1`, `control_path_2` và structured `sample.samples`. Nếu báo trainer cũ, cập nhật checkout `/workspace/ai-toolkit` và dependencies trước khi chạy tiếp. Config hai input được đối chiếu với mã nguồn AI Toolkit: https://github.com/ostris/ai-toolkit/blob/main/toolkit/config_modules.py
+
+Smoke run dùng output riêng `/workspace/output/removal_dual_4b_smoke`. Xem preview, xác nhận đủ hai input và theo dõi VRAM trước khi chạy đầy đủ:
+
+```bash
 python core/train.py
 ```
 
-Wrapper kiểm tra dataset đã chuẩn bị, từ chối path `data/removal`, kiểm tra weight trong `/workspace/data`, rồi chạy:
-
-```bash
-python run.py /path/to/core/configs/removal_scribble_4b.yaml
-```
-
-trong `/workspace/ai-toolkit`.
-
-Config đã chốt:
-
-| Tham số | Giá trị |
-| --- | --- |
-| Backbone | `black-forest-labs/FLUX.2-klein-base-4B` |
-| LoRA | rank 32, alpha 32 |
-| Learning rate | 1e-4, AdamW 8-bit |
-| Steps | 1500 |
-| Resolution | 512 |
-| Save | mỗi 250 steps, giữ 6 checkpoint |
-| Batch | 1, gradient accumulation 4 |
-| Scheduler | flowmatch |
-
-Log đầy đủ nằm ở `/workspace/output/removal_scribble_4b/train.log`. Thanh tqdm phía trên là của wrapper: step/1500, loss trung bình 20 step gần nhất, và mốc checkpoint kế tiếp. ai-toolkit vẫn in dòng của nó vào log.
-
-Checkpoint nằm trong `/workspace/output/removal_scribble_4b/`. Các mốc 250, 500, 750, 1000 và 1250 có dạng `removal_scribble_4b_000000250.safetensors`. File cuối `removal_scribble_4b.safetensors` không có số ở đuôi; đó là weight sau đúng 1500 step. Vòng lặp của ai-toolkit không ghi thêm một file `_000001500`.
-
-Dừng bằng Ctrl-C. Chạy tiếp:
+Output mới: `/workspace/output/removal_dual_4b/`, tách khỏi run một input cũ. Log `train.log`; checkpoint mỗi 250 steps. File cuối `removal_dual_4b.safetensors` tương ứng step cuối, có thể không có số ở tên. Tiếp tục run hai input bằng:
 
 ```bash
 python core/train.py --resume
 ```
 
-Nếu không truyền `--resume` mà folder output đã có `.safetensors`, script dừng để tránh nối run nhầm. ai-toolkit tự đọc checkpoint mới nhất khi được phép resume.
+Không resume checkpoint cũ một input để so sánh thí nghiệm này. Nếu OOM, giảm tải sampling hoặc cấu hình model sau khi xem log; hai reference có thể dùng nhiều VRAM hơn.
 
-Preview trong lúc train dùng đúng câu prompt chung và 4 ảnh validation. Ảnh sample nằm cạnh checkpoint, trong `samples/`.
-
-## 5. Benchmark
+## 3. Chọn checkpoint bằng validation
 
 ```bash
-source core/env.sh
 conda activate klein-infer
-python core/benchmark.py --baseline
+python core/benchmark.py --baseline --split validation \
+  --output /workspace/output/removal_dual_4b/benchmark_validation
 ```
 
-Bỏ `--baseline` nếu không cần mốc pipeline không LoRA.
+Chạy tất cả checkpoint và baseline không LoRA trên 7 validation. Cùng input, prompt, seeds và cấu hình inference. Mặc định resolution 512 + 1024; có thể dùng `--resolutions 512` hoặc `--seeds 42 123 2026` cho cả hai nhánh.
 
-Script load bản distilled, 4 step, `guidance_scale=4`, seed 42. Với mỗi checkpoint nó chạy 15 mẫu held-out ở cạnh dài 512 và 1024. Ảnh được làm tròn về bội số của 16 và giữ `(width * height) / 256 <= 4096`.
+Kết quả gồm `results.csv`, `run_config.json`, `report.md`, ảnh output, contact sheet từng mẫu và `review.html`. Không ghi đè một folder đã có results.csv; chọn output mới khi chạy lại. Lỗi OOM được giữ trong results.csv và báo coverage, không âm thầm bỏ mẫu.
 
-Vùng đo là nét đỏ thuần trên `reference/` (R cao, G và B thấp), không phải mọi vùng ấm của ảnh. Vòng tròn được lấp kín rồi dilate nhẹ. `mask/` không được đọc.
+Metric tự động:
 
-| Metric | Ý nghĩa |
+| Metric | Vùng và ý nghĩa |
 | --- | --- |
-| `scribble_residue` | Tỉ lệ pixel của nét đỏ còn đỏ trong output. Thấp hơn là tốt. |
-| `preserve_psnr`, `preserve_ssim` | So output với `reference` bên ngoài vòng tròn. Cao hơn là tốt. |
-| `target_lpips` | Khoảng cách tới `target/`. Thấp hơn là gần ảnh đích hơn, nhưng target không pixel-aligned nên chỉ là tín hiệu mềm. |
+| scribble_residue ↓ | Tỷ lệ vị trí nét rõ còn màu gần màu marker; không phát hiện nét bị dịch vị trí. |
+| preserve_psnr ↑ | So output với original sạch ngoài vùng edit ước lượng từ nét. |
+| preserve_ssim ↑ | Trung bình bản đồ SSIM trên các cửa sổ 7x7 nằm hoàn toàn ngoài vùng edit và biên ảnh. |
+| target_lpips ↓ | LPIPS toàn ảnh so với target, chỉ tham khảo vì target có thể thay đổi ngoài vùng xóa. |
+| edit_lpips ↓ | LPIPS crop bounding box vùng edit, có cả context; không phải LPIPS mask theo từng pixel. |
 
-Kết quả:
+Vùng edit được ước lượng bằng đóng nét, convex hull theo thành phần liên thông và giãn nhẹ. Đây không phải segmentation vật thể; kiểm tra contact sheet và edit_fraction khi giải thích preservation.
 
-- `/workspace/output/removal_scribble_4b/benchmark/results.csv` — từng ảnh.
-- `benchmark/report.md` — trung bình theo checkpoint và resolution, kèm checkpoint nên xem trước.
-- `benchmark/sheets/<checkpoint>_<resolution>.jpg` — mỗi hàng là `reference | output | target`.
-- `benchmark/images/` — output đầy đủ.
+## 4. Chấm thành công bằng người
 
-Đọc `report.md` trước, rồi mở contact sheet của checkpoint được đề xuất. Nếu step 1500 vẫn tốt hơn step 1250, report sẽ nói pilot chưa chạm đỉnh. Copy checkpoint muốn giữ ra ngoài folder output (vì config chỉ giữ 6 file), tăng `steps` trong yaml cho lớn hơn 1500, rồi `python core/train.py --resume`.
+Mở `review.html` (tải cả folder benchmark về máy nếu chạy trên pod). Thứ tự mẫu được xáo trộn, không hiện checkpoint. Cột ảnh: original | reference | output | target nếu có. Chấm 0/1 cho bốn tiêu chí:
 
-## 6. Gradio
+- removal_success: xóa hết đúng vật thể được chỉ định, không còn mảnh nhận ra được.
+- marker_clear: không còn nét chỉ dẫn ở bất kỳ đâu.
+- background_natural: nền phục hồi hợp lý, không có vết vá/méo rõ.
+- outside_preserved: không thay đổi rõ ràng nội dung ngoài chỉnh sửa được yêu cầu.
+
+Page lưu tạm trong browser, có import/export CSV. Bấm Download review.csv rồi:
 
 ```bash
-source core/env.sh
+python core/review_benchmark.py /path/to/results.csv --review /path/to/review.csv
+```
+
+`human_report.md` báo từng tỷ lệ, số đếm và Overall Success Rate (đạt cả bốn tiêu chí), riêng theo dataset/split/checkpoint/resolution. Review chưa đủ được để pending. Chọn checkpoint trên validation bằng removal/overall success và preservation; metric tự động không tự chứng minh đã remove thành công. Không so sánh các nhánh có coverage khác nhau.
+
+## 5. Test nội bộ và VIBE Removal
+
+Sau khi chốt checkpoint bằng validation, đánh giá 8 ảnh test:
+
+```bash
+python core/benchmark.py --baseline --split test \
+  --checkpoint /workspace/output/removal_dual_4b/CHOSEN.safetensors \
+  --output /workspace/output/removal_dual_4b/benchmark_test
+```
+
+Chuẩn bị toàn bộ VIBE Removal (100 mẫu trước khi kiểm tra overlap):
+
+```bash
+python core/prepare_vibe.py --download
+```
+
+Script tải riêng Removal.json, ảnh nguồn và lớp chỉ dẫn cần thiết. Revision được cố định bằng commit SHA trong lần tải và ghi vào dataset_card.json. Có thể tái lập bằng `--revision <sha>`. Nếu dataset đã có sẵn, dùng `--root /path/to/VIBE-Benchmark` không có `--download`.
+
+VIBE được ghép từ original + visual instruction gốc, không vẽ lại vòng tròn. Prompt giữ input_prompt của VIBE, thêm cùng phần giải thích hai ảnh cho baseline và LoRA. Loại ảnh trùng pixel chính xác với toàn bộ original nội bộ; ảnh gần trùng cần xem thủ công. VIBE Removal hiện không có target sau chỉnh sửa nên LPIPS để trống.
+
+```bash
+python core/benchmark.py --baseline --split external \
+  --manifest /workspace/datasets/vibe_removal/manifest.json \
+  --checkpoint /workspace/output/removal_dual_4b/CHOSEN.safetensors \
+  --output /workspace/output/removal_dual_4b/benchmark_vibe
+```
+
+VIBE chỉ dùng đánh giá cuối, không chọn checkpoint. Báo riêng VIBE và test nội bộ, không gộp trung bình. Chấm review.html giống bước 4. Đây là thiết lập VIBE hai input với rubric của dự án; không phải điểm leaderboard chính thức. Pipeline judge chính thức tham khảo https://github.com/hwanyu112/VIBE-Benchmark . Chưa tự động gọi dịch vụ judge bên ngoài.
+
+## 6. Gradio và kiểm tra local
+
+```bash
 conda activate klein-infer
 python core/app.py
 ```
 
-App nghe `0.0.0.0:7860` và bật Gradio `share`, nên log in một URL public dạng `https://....gradio.live`. Mở URL đó từ máy bất kỳ; không cần SSH tunnel. Link share sống khoảng 72 giờ và hết hạn khi process dừng.
+Upload original sạch và vẽ trong editor để giữ được cả background và composite. Gallery test cũng dùng hai input. App bật share như trước.
 
-Trên pod, `http://<pod-ip>:7860` vẫn dùng được nếu cổng 7860 được mở.
-
-Tab **Scribble & Remove**: upload ảnh, vẽ vòng tròn đỏ, bấm Remove. Slider hiện ảnh trước và sau. Prompt bị khóa đúng một câu đã train. Sidebar chọn checkpoint, LoRA scale, số step, guidance và seed. Pipeline mặc định là distilled 4 step; chuyển sang base sẽ đẩy số step lên 50.
-
-Tab **Held-out gallery**: chạy 8 mẫu test trong `removal_dataset`.
-
-Bấm **Refresh checkpoints** nếu train vừa xong và dropdown chưa thấy file mới.
-
-## Xử lý lỗi
-
-**OOM lúc train.** Config đã là 512, gradient checkpointing bật, text encoder quantize. Đóng process khác trên GPU. Nếu OOM ngay lúc sample, thêm `disable_sampling: true` dưới `train:` rồi chấm bằng `benchmark.py`.
-
-**OOM lúc benchmark ở 1024.** Dòng đó bị bỏ qua và ghi `OOM` ra stderr. Kết quả 512 vẫn được ghi. Chạy lại không cần `--resolutions 1024` nếu chỉ muốn 512:
+Kiểm tra CPU, không tải weights:
 
 ```bash
-python core/benchmark.py --resolutions 512
+python -B -m unittest discover -s tests -v
 ```
 
-**`HF_TOKEN` sai hoặc thiếu.** Hub trả 401 hoặc chậm. Sửa `.env`, `source core/env.sh`, chạy lại `setup.sh`.
-
-**`PEFT backend is required`.** Đang ở nhầm env. Benchmark và Gradio phải dùng `klein-infer`, nơi đã cài `peft==0.18.1`.
-
-**Path bị từ chối vì `data/removal`.** Một `folder_path`, `control_path` hoặc `--ctrl_img` đang trỏ vào tập cũ. Train chỉ được đọc `/workspace/datasets/removal_scribble`, là bản copy của `removal_dataset`.
-
-**Thiếu `dataset_card.json`.** Chưa chạy `prepare_dataset.py` trên pod.
-
-**Thiếu weight.** `train.py` dừng và liệt kê repo chưa có trong `/workspace/data`. Chạy lại `setup.sh`.
-
-**Cache latents.** `cache_latents_to_disk: true` đã bật. Lần train đầu sẽ encode trước khi thấy step tăng. Đó không phải là treo.
+Cần Pillow, NumPy, OpenCV, scikit-image và PyYAML. Test kiểm tra mapping/split, thứ tự input, metric vùng edit, VIBE schema/overlap và tổng hợp human review. GPU train/inference vẫn cần smoke run trên pod.

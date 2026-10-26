@@ -24,8 +24,8 @@ from common import (
     PREPARED_DIR,
     PROMPT,
     assert_not_old_removal,
-    fit_klein_size,
     load_runtime_env,
+    resize_inputs,
 )
 
 MODELS = {
@@ -112,6 +112,7 @@ def test_records() -> list[dict[str, str]]:
                         "index": row["index"],
                         "split": "test",
                         "reference": str(reference),
+                        "original": str(dataset / "original" / f"{row['index']}.png"),
                         "prompt": PROMPT,
                     }
                 )
@@ -130,15 +131,24 @@ def as_pil(value) -> Image.Image | None:
     return Image.fromarray(value).convert("RGB")
 
 
-def prepare_image(image: Image.Image) -> tuple[Image.Image, int, int]:
-    longest = min(max(image.size), 1024)
-    width, height = fit_klein_size(image.width, image.height, longest)
-    resized = image.resize((width, height), Image.Resampling.LANCZOS)
-    return resized, width, height
+def editor_inputs(value) -> list[Image.Image]:
+    if not isinstance(value, dict) or value.get("background") is None:
+        raise ValueError("Upload a clean original and draw the circle in the editor.")
+    original = as_pil(value["background"])
+    reference = as_pil(value.get("composite"))
+    if reference is None:
+        reference = original.convert("RGBA")
+        for layer in value.get("layers") or []:
+            layer = layer if isinstance(layer, Image.Image) else Image.fromarray(layer)
+            if layer.size != original.size:
+                raise ValueError("annotation size differs from original")
+            reference = Image.alpha_composite(reference, layer.convert("RGBA"))
+        reference = reference.convert("RGB")
+    return resize_inputs(original, reference, min(max(original.size), 1024))
 
 
 def run_pipe(
-    image: Image.Image,
+    images: list[Image.Image],
     repo: str,
     lora_path: str | None,
     scale: float,
@@ -148,31 +158,33 @@ def run_pipe(
 ) -> tuple[Image.Image, Image.Image]:
     import torch
 
-    resized, width, height = prepare_image(image)
+    original, reference = images
+    width, height = original.size
     pipe = CACHE.get(repo, lora_path, scale)
     generator = torch.Generator(device="cuda").manual_seed(int(seed))
     with torch.inference_mode():
         return pipe(
             prompt=PROMPT,
-            image=resized,
+            image=[original, reference],
             num_inference_steps=int(steps),
             guidance_scale=float(guidance),
             width=width,
             height=height,
             generator=generator,
-        ).images[0], resized
+        ).images[0], original
 
 
 def remove_object(editor_value, model_label: str, checkpoint: str, scale: float, steps: int, guidance: float, seed: int):
-    image = as_pil(editor_value)
-    if image is None:
-        raise gr.Error("Upload an image and draw a red circle on the object to remove.")
+    try:
+        images = editor_inputs(editor_value)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
     repo, _default_steps = MODELS[model_label]
     lora_path = checkpoint_map().get(checkpoint)
     if checkpoint != "baseline (no LoRA)" and lora_path is None:
         raise gr.Error(f"Checkpoint not found: {checkpoint}")
     try:
-        output, model_input = run_pipe(image, repo, lora_path, scale, steps, guidance, seed)
+        output, model_input = run_pipe(images, repo, lora_path, scale, steps, guidance, seed)
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
     return (model_input, output)
@@ -184,10 +196,14 @@ def run_held_out(model_label: str, checkpoint: str, scale: float, steps: int, gu
         raise gr.Error("No test split found in removal_dataset.")
     repo, _default_steps = MODELS[model_label]
     lora_path = checkpoint_map().get(checkpoint)
+    if checkpoint != "baseline (no LoRA)" and lora_path is None:
+        raise gr.Error(f"Checkpoint not found: {checkpoint}")
     gallery = []
     for record in records:
         reference = Image.open(assert_not_old_removal(Path(record["reference"]))).convert("RGB")
-        output, _model_input = run_pipe(reference, repo, lora_path, scale, steps, guidance, seed)
+        original = Image.open(assert_not_old_removal(Path(record["original"]))).convert("RGB")
+        images = resize_inputs(original, reference, min(max(original.size), 1024))
+        output, _model_input = run_pipe(images, repo, lora_path, scale, steps, guidance, seed)
         gallery.append((output, record["index"]))
     return gallery
 
@@ -200,7 +216,7 @@ def build() -> gr.Blocks:
     load_runtime_env()
     choices = list(checkpoint_map())
     with gr.Blocks(title="Red-circle removal") as demo:
-        gr.Markdown("Xóa vật thể nằm trong vòng tròn đỏ, rồi xóa luôn vòng tròn.")
+        gr.Markdown("Upload ảnh gốc sạch rồi vẽ vòng tròn đỏ. Model nhận ảnh gốc và ảnh có nét vẽ.")
         gr.Textbox(value=PROMPT, label="Prompt", interactive=False)
         with gr.Row():
             with gr.Column(scale=1):

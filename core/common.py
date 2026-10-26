@@ -12,12 +12,38 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATASET_DIR = REPO_ROOT / "data" / "removal_dataset"
-PREPARED_DIR = Path(os.environ.get("REMOVAL_PREPARED", "/workspace/datasets/removal_scribble"))
-OUTPUT_DIR = Path(os.environ.get("REMOVAL_OUTPUT", "/workspace/output/removal_scribble_4b"))
+PREPARED_DIR = Path(os.environ.get("REMOVAL_PREPARED", "/workspace/datasets/removal_dual"))
+OUTPUT_DIR = Path(os.environ.get("REMOVAL_OUTPUT", "/workspace/output/removal_dual_4b"))
 AITOOLKIT_DIR = Path(os.environ.get("AITOOLKIT", "/workspace/ai-toolkit"))
 TRAIN_CONFIG = REPO_ROOT / "core" / "configs" / "removal_scribble_4b.yaml"
 
-PROMPT = "Remove the object inside the red circle and naturally restore the background."
+INSTRUCTION = "Remove the object inside the red circle and naturally restore the background."
+REFERENCE_ORDER = ["original", "reference"]
+PROMPT_PREFIX = (
+    "Image 1 is the original image to edit. "
+    "Image 2 is the same image with annotations indicating the edit. "
+    "Use image 1 as the source and image 2 as spatial guidance. "
+    "Do not reproduce the annotation strokes in the output. "
+    "Preserve content outside the requested edit. Editing instruction: "
+)
+
+
+def edit_prompt(instruction: str) -> str:
+    return PROMPT_PREFIX + instruction.strip()
+
+
+PROMPT = edit_prompt(INSTRUCTION)
+
+
+def resize_inputs(original, reference, longest: int):
+    """Keep both conditioning images in the same coordinate system."""
+    from PIL import Image
+
+    if original.size != reference.size:
+        raise ValueError(f"original {original.size} != reference {reference.size}")
+    size = fit_klein_size(*original.size, longest)
+    return [image.convert("RGB").resize(size, Image.Resampling.LANCZOS)
+            for image in (original, reference)]
 
 BASE_REPO = "black-forest-labs/FLUX.2-klein-base-4B"
 DISTILLED_REPO = "black-forest-labs/FLUX.2-klein-4B"

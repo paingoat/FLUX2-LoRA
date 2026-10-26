@@ -1,385 +1,304 @@
-"""Score every saved EditLoRA on the held-out red-circle pairs.
-
-Images and the prompt come from data/removal_dataset via the manifest written
-by prepare_dataset.py. The copied mask/ folder is not read: the circle is
-taken from red pixels on reference/.
-"""
-
+"""Two-input removal evaluation. Select on validation; test/VIBE stay separate."""
 from __future__ import annotations
-
 import argparse
 import csv
+import hashlib
 import json
-import re
-import sys
 from pathlib import Path
+import re
 
 import numpy as np
 from PIL import Image, ImageDraw
+from common import (DISTILLED_REPO, OUTPUT_DIR, PREPARED_DIR, PROMPT,
+                    assert_not_old_removal, edit_prompt, load_runtime_env, resize_inputs)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from common import (
-    DISTILLED_REPO,
-    OUTPUT_DIR,
-    PREPARED_DIR,
-    PROMPT,
-    assert_not_old_removal,
-    fit_klein_size,
-    load_runtime_env,
-)
-
-GUIDANCE = 4.0
-STEPS = 4
-SEED = 42
+GUIDANCE, STEPS, SEED = 4.0, 4, 42
+METRICS = ('scribble_residue', 'preserve_psnr', 'preserve_ssim', 'target_lpips', 'edit_lpips')
 
 
-def load_manifest(path: Path) -> list[dict[str, str]]:
-    records = json.loads(path.read_text(encoding="utf-8"))
+def load_manifest(path: Path) -> list[dict]:
+    records = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(records, list) or not records:
-        raise SystemExit(f"{path} has no held-out records")
+        raise ValueError(f'{path}: expected nonempty manifest')
+    identities = set()
     for record in records:
-        for key in ("reference", "target"):
-            record[key] = str(assert_not_old_removal(Path(record[key])))
-        if record.get("prompt") != PROMPT:
-            raise SystemExit(f"{record.get('index')} prompt is not the shared removal prompt")
+        record.setdefault('dataset', 'internal')
+        identity = (record['dataset'], record['index'])
+        if identity in identities or any(not re.fullmatch(r'[A-Za-z0-9_-]+', p) for p in identity):
+            raise ValueError(f'duplicate or invalid sample identity: {identity}')
+        identities.add(identity)
+        if record['split'] not in {'validation', 'test', 'external'}:
+            raise ValueError('benchmark accepts held-out data only')
+        for key in ('original', 'reference', 'target', 'stroke_mask'):
+            if record.get(key):
+                candidate = Path(record[key])
+                if not candidate.is_absolute():
+                    candidate = path.parent / candidate
+                candidate = assert_not_old_removal(candidate)
+                if not candidate.is_file():
+                    raise ValueError(f'missing {key}: {candidate}')
+                record[key] = str(candidate)
+        if not record.get('original') or not record.get('reference'):
+            raise ValueError('manifest needs original and reference; prepare it again')
+        expected = edit_prompt(record['instruction']) if record['dataset'] == 'vibe_removal' else PROMPT
+        if record.get('prompt') != expected:
+            raise ValueError(f'{identity}: prompt differs from two-input protocol')
     return records
 
 
-def red_region(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return the pure-red stroke and the circle it encloses.
-
-    The marker is a narrow bright-red ring. A loose hue threshold also catches
-    warm scenes, so the stroke is the pixels that are actually red.
-    """
+def edit_region(stroke: np.ndarray) -> np.ndarray:
+    """Approximate edit region from annotation geometry, not object ground truth."""
     import cv2
-
-    red = rgb[:, :, 0].astype(np.int16)
-    green = rgb[:, :, 1].astype(np.int16)
-    blue = rgb[:, :, 2].astype(np.int16)
-    stroke = (
-        (red >= 200) & (green <= 70) & (blue <= 70) & ((red - np.maximum(green, blue)) >= 120)
-    ).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    closed = cv2.morphologyEx(stroke, cv2.MORPH_CLOSE, kernel)
-    flood = closed.copy()
-    flood_mask = np.zeros((closed.shape[0] + 2, closed.shape[1] + 2), np.uint8)
-    if closed[0, 0] == 0:
-        cv2.floodFill(flood, flood_mask, (0, 0), 2)
-    interior = flood == 0
-    interior_fraction = float(interior.mean()) if interior.size else 1.0
-    if interior_fraction < 0.002 or interior_fraction > 0.85:
-        edit = cv2.dilate(stroke, kernel, iterations=2)
-    else:
-        edit = cv2.dilate((closed.astype(bool) | interior).astype(np.uint8), kernel, iterations=1)
-    return stroke.astype(bool), edit.astype(bool)
+    size = max(3, round(max(stroke.shape) / 100) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    closed = cv2.morphologyEx(stroke.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    region = np.zeros_like(closed)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        if len(contour) >= 3:
+            # Enclose open/clipped circles; disconnected marks stay separate.
+            cv2.drawContours(region, [cv2.convexHull(contour)], -1, 1, cv2.FILLED)
+    return cv2.dilate(region | closed, kernel).astype(bool)
 
 
 def psnr(left: np.ndarray, right: np.ndarray) -> float:
     mse = float(np.mean((left.astype(np.float32) - right.astype(np.float32)) ** 2))
-    if mse == 0:
-        return 99.0
-    return float(10.0 * np.log10((255.0 ** 2) / mse))
+    return 99.0 if mse == 0 else float(10 * np.log10(255 ** 2 / mse))
 
 
-def masked_ssim(reference: np.ndarray, output: np.ndarray, edit: np.ndarray) -> float:
+def masked_ssim(original: np.ndarray, output: np.ndarray, edit: np.ndarray) -> float | None:
+    import cv2
     from skimage.metrics import structural_similarity
-
-    matched = output.copy()
-    matched[edit] = reference[edit]
-    score = structural_similarity(reference, matched, channel_axis=2, data_range=255)
-    return float(score)
-
-
-def resize_pair(reference: Image.Image, target: Image.Image, longest: int) -> tuple[Image.Image, Image.Image, int, int]:
-    width, height = fit_klein_size(reference.width, reference.height, longest)
-    resampling = Image.Resampling.LANCZOS
-    return (
-        reference.convert("RGB").resize((width, height), resampling),
-        target.convert("RGB").resize((width, height), resampling),
-        width,
-        height,
-    )
+    _, score_map = structural_similarity(original, output, channel_axis=2, data_range=255, full=True)
+    # Only 7x7 windows lying wholly outside the edit and image border count.
+    valid = cv2.erode((~edit).astype(np.uint8), np.ones((7, 7), np.uint8),
+                      borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    return float(score_map.mean(axis=2)[valid].mean()) if valid.any() else None
 
 
-def score_pair(reference: Image.Image, output: Image.Image, target: Image.Image, lpips_fn) -> dict[str, float | None]:
-    import torch
-
-    ref = np.asarray(reference)
-    out = np.asarray(output.resize(reference.size, Image.Resampling.LANCZOS))
-    tgt = np.asarray(target)
-    stroke, edit = red_region(ref)
-    outside = ~edit
-    residue = None
-    preserve_psnr = None
-    preserve_ssim = None
-    stroke_count = int(stroke.sum())
-    if stroke_count > 0 and outside.any() and 0 < int(edit.sum()) < edit.size * 0.9:
-        residue = float(np.logical_and(stroke, red_region(out)[0]).sum()) / stroke_count
-        preserve_psnr = psnr(ref[outside], out[outside])
-        preserve_ssim = masked_ssim(ref, out, edit)
-
-    def tensor(image: np.ndarray) -> torch.Tensor:
-        data = torch.from_numpy(image).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-        return data * 2.0 - 1.0
-
-    device = next(lpips_fn.parameters()).device
-    with torch.inference_mode():
-        distance = lpips_fn(tensor(out).to(device), tensor(tgt).to(device))
-    return {
-        "scribble_residue": residue,
-        "preserve_psnr": preserve_psnr,
-        "preserve_ssim": preserve_ssim,
-        "target_lpips": float(distance.item()),
-    }
-
-
-def contact_sheet(triples: list[tuple[str, Image.Image, Image.Image, Image.Image]], destination: Path) -> None:
-    thumb_h = 240
-    gap = 6
-    rows = []
-    width = 0
-    for _label, reference, output, target in triples:
-        thumbs = []
-        for image in (reference, output, target):
-            scale = thumb_h / image.height
-            thumbs.append(image.resize((max(1, int(image.width * scale)), thumb_h), Image.Resampling.LANCZOS))
-        rows.append(thumbs)
-        width = max(width, gap + sum(image.width + gap for image in thumbs))
-    canvas = Image.new("RGB", (width, (thumb_h + gap) * len(rows) + gap), "white")
-    draw = ImageDraw.Draw(canvas)
-    y = gap
-    for (label, *_images), thumbs in zip(triples, rows):
-        x = gap
-        for image in thumbs:
-            canvas.paste(image, (x, y))
-            x += image.width + gap
-        draw.text((gap, y + 4), label, fill=(255, 255, 0))
-        y += thumb_h + gap
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(destination, quality=90)
+def score_pair(original: Image.Image, reference: Image.Image, output: Image.Image,
+               target: Image.Image | None, lpips_fn=None, stroke_mask=None) -> dict:
+    src, ref, out = [np.asarray(image.convert('RGB')) for image in (original, reference, output)]
+    if src.shape != ref.shape or src.shape != out.shape:
+        raise ValueError('metric images must have identical dimensions')
+    difference = np.abs(ref.astype(np.int16) - src.astype(np.int16)).max(axis=2)
+    stroke = difference > 8 if stroke_mask is None else np.asarray(stroke_mask) > 127
+    if stroke.shape != src.shape[:2]:
+        raise ValueError('stroke mask size differs from original')
+    edit = edit_region(stroke)
+    result = dict.fromkeys(METRICS)
+    result['edit_fraction'] = float(edit.mean())
+    if stroke.any():
+        marker_distance = np.abs(out.astype(np.int16) - ref.astype(np.int16)).max(axis=2)
+        strong_stroke = stroke & (difference >= 40)
+        if strong_stroke.any():
+            result['scribble_residue'] = float((marker_distance[strong_stroke] <= 30).mean())
+    if stroke.any() and 0 < edit.mean() < 0.9:
+        result['preserve_psnr'] = psnr(src[~edit], out[~edit])
+        result['preserve_ssim'] = masked_ssim(src, out, edit)
+    if target is not None and lpips_fn is not None:
+        import torch
+        device = next(lpips_fn.parameters()).device
+        def distance(a, b):
+            def tensor(array):
+                image = Image.fromarray(array)
+                if min(image.size) < 64:
+                    factor = 64 / min(image.size)
+                    image = image.resize(tuple(round(side * factor) for side in image.size))
+                data = np.asarray(image).copy()
+                return torch.from_numpy(data).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1
+            with torch.inference_mode():
+                return float(lpips_fn(tensor(a), tensor(b)).item())
+        tgt = np.asarray(target.convert('RGB'))
+        if tgt.shape != out.shape:
+            raise ValueError('target size differs from output')
+        result['target_lpips'] = distance(out, tgt)
+        if stroke.any() and edit.any():
+            ys, xs = np.where(edit)
+            crop = np.s_[ys.min():ys.max()+1, xs.min():xs.max()+1]
+            result['edit_lpips'] = distance(out[crop], tgt[crop])
+    return result
 
 
 def checkpoint_step(path: Path | None) -> int:
-    """Step from a zero-padded filename, or from the final unsuffixed save."""
     if path is None:
         return -1
-    match = re.search(r"_(\d{6,})$", path.stem)
+    match = re.search(r'_(\d{6,})$', path.stem)
     if match:
         return int(match.group(1))
-    if not path.is_file():
-        return -1
     try:
         from safetensors import safe_open
-
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            raw = (handle.metadata() or {}).get("training_info")
-        if raw:
-            return int(json.loads(raw)["step"])
-    except Exception:
+        with safe_open(str(path), framework='pt', device='cpu') as handle:
+            return int(json.loads((handle.metadata() or {})['training_info'])['step'])
+    except (OSError, ValueError, KeyError, ImportError):
         return -1
-    return -1
 
 
-def mean(values: list[float]) -> float | None:
-    return sum(values) / len(values) if values else None
+def write_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else ['status'])
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
 
 
-def column_mean(items: list[dict], key: str) -> float | None:
-    values = [float(item[key]) for item in items if item[key] != ""]
-    return mean(values)
+def contact_sheet(images: list[Image.Image], label: str, path: Path) -> None:
+    thumbs = [image.copy() for image in images]
+    canvas = Image.new('RGB', (sum(image.width for image in thumbs), max(image.height for image in thumbs) + 30), 'white')
+    x = 0
+    for image in thumbs:
+        canvas.paste(image, (x, 30))
+        x += image.width
+    ImageDraw.Draw(canvas).text((5, 5), label, fill='black')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
 
 
 def write_report(rows: list[dict], destination: Path) -> None:
-    grouped: dict[tuple[str, int], list[dict]] = {}
+    grouped = {}
     for row in rows:
-        grouped.setdefault((row["checkpoint"], int(row["resolution"])), []).append(row)
-
-    summary = []
-    for (checkpoint, resolution), items in sorted(grouped.items(), key=lambda item: (item[0][1], checkpoint_step(Path(item[0][0])))):
-        summary.append(
-            {
-                "checkpoint": checkpoint,
-                "step": items[0]["step"],
-                "resolution": resolution,
-                "n": len(items),
-                "scribble_residue": column_mean(items, "scribble_residue"),
-                "preserve_psnr": column_mean(items, "preserve_psnr"),
-                "preserve_ssim": column_mean(items, "preserve_ssim"),
-                "target_lpips": column_mean(items, "target_lpips"),
-            }
-        )
-
-    def fmt(value: float | None) -> str:
-        return "" if value is None else f"{value:.4f}"
-
-    lines = [
-        "# EditLoRA removal benchmark",
-        "",
-        "Vùng đo là vòng tròn đỏ trên `reference/` của `removal_dataset`. `mask/` không được đọc.",
-        "`scribble_residue` thấp hơn thì nét đỏ còn ít hơn. `preserve_psnr` và `preserve_ssim` cao hơn thì phần ngoài vòng tròn bị đụng ít hơn. `target_lpips` là tín hiệu mềm vì ảnh target không pixel-aligned.",
-        "",
-        "| Checkpoint | Step | Resolution | Residue | PSNR | SSIM | LPIPS |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for item in summary:
-        lines.append(
-            f"| {item['checkpoint']} | {item['step']} | {item['resolution']} | "
-            f"{fmt(item['scribble_residue'])} | {fmt(item['preserve_psnr'])} | "
-            f"{fmt(item['preserve_ssim'])} | {fmt(item['target_lpips'])} |"
-        )
-
-    for resolution in sorted({item["resolution"] for item in summary}):
-        subset = [item for item in summary if item["resolution"] == resolution and item["checkpoint"] != "baseline"]
-        usable = [item for item in subset if None not in (item["scribble_residue"], item["preserve_psnr"], item["preserve_ssim"], item["target_lpips"])]
-        if len(usable) < 2:
-            continue
-        rank_sum = {id(item): 0 for item in usable}
-
-        def add_ranks(key: str, higher_better: bool) -> None:
-            ordered = sorted(usable, key=lambda item: item[key], reverse=higher_better)
-            for place, item in enumerate(ordered, start=1):
-                rank_sum[id(item)] += place
-
-        add_ranks("scribble_residue", False)
-        add_ranks("preserve_psnr", True)
-        add_ranks("preserve_ssim", True)
-        add_ranks("target_lpips", False)
-        winner = min(usable, key=lambda item: (rank_sum[id(item)], -int(item["step"])))
-        lines.append("")
-        lines.append(
-            f"Resolution {resolution}: checkpoint nên xem trước là step {winner['step']} "
-            f"(`{winner['checkpoint']}`), theo hạng trung bình của 4 metric."
-        )
-        by_step = {int(item["step"]): item for item in usable}
-        if 1500 in by_step and 1250 in by_step and int(winner["step"]) == 1500:
-            latest = by_step[1500]
-            previous = by_step[1250]
-            if latest["preserve_psnr"] > previous["preserve_psnr"] or latest["scribble_residue"] < previous["scribble_residue"]:
-                lines.append(
-                    "Step 1500 vẫn tốt hơn step 1250. Pilot này có thể chưa chạm đỉnh; train tiếp bằng `python core/train.py --resume`."
-                )
-
-    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        key = tuple(row[field] for field in ('dataset', 'split', 'checkpoint', 'resolution'))
+        grouped.setdefault(key, []).append(row)
+    lines = ['# Two-input removal benchmark', '',
+             'Original + annotated reference; identical prompts and seeds for baseline and LoRA.',
+             'Choose checkpoints using internal validation only. Test and VIBE are final evaluation.',
+             'Automatic metrics do not establish removal success. Complete the blind human review.',
+             'Preservation uses clean original outside a region estimated from annotation geometry.',
+             'LPIPS is advisory: targets can differ outside the edit. Missing targets stay blank.', '',
+             '| Dataset | Split | Checkpoint | Resolution | OK/attempted | Residue ↓ | PSNR ↑ | SSIM ↑ | LPIPS ↓ | Edit crop LPIPS ↓ |',
+             '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+    for key, items in sorted(grouped.items()):
+        ok = [row for row in items if row['status'] == 'ok']
+        values = []
+        for metric in METRICS:
+            numbers = [float(row[metric]) for row in ok if row.get(metric) not in (None, '')]
+            values.append(f'{np.mean(numbers):.4f} (n={len(numbers)})' if numbers else '—')
+        lines.append('| ' + ' | '.join(map(str, key)) + f' | {len(ok)}/{len(items)} | ' + ' | '.join(values) + ' |')
+    lines += ['', 'Do not compare means if runs have different successful sample coverage.',
+              'Residue counts marker-like colors at original stroke positions; displaced strokes are not detected.',
+              'Edit LPIPS uses a bounding crop with context, not pixel-masked LPIPS.']
+    destination.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
-def generate(pipe, reference: Image.Image, width: int, height: int, seed: int) -> Image.Image:
+def generate(pipe, images, prompt: str, seed: int) -> Image.Image:
     import torch
-
-    generator = torch.Generator(device="cuda").manual_seed(seed)
+    generator = torch.Generator(device='cuda').manual_seed(seed)
     with torch.inference_mode():
-        return pipe(
-            prompt=PROMPT,
-            image=reference,
-            num_inference_steps=STEPS,
-            guidance_scale=GUIDANCE,
-            width=width,
-            height=height,
-            generator=generator,
-        ).images[0]
+        return pipe(prompt=prompt, image=images, num_inference_steps=STEPS,
+                    guidance_scale=GUIDANCE, width=images[0].width, height=images[0].height,
+                    generator=generator).images[0]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, default=PREPARED_DIR / "eval" / "manifest.json")
-    parser.add_argument("--checkpoints", type=Path, default=OUTPUT_DIR)
-    parser.add_argument("--output", type=Path, default=OUTPUT_DIR / "benchmark")
-    parser.add_argument("--baseline", action="store_true", help="also score the distilled pipeline with no LoRA")
-    parser.add_argument("--resolutions", type=int, nargs="+", default=[512, 1024])
-    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument('--manifest', type=Path, nargs='+', default=[PREPARED_DIR / 'eval/manifest.json'])
+    parser.add_argument('--checkpoints', type=Path, default=OUTPUT_DIR)
+    parser.add_argument('--checkpoint', type=Path, nargs='+')
+    parser.add_argument('--split', nargs='+', choices=['validation', 'test', 'external'], default=['validation'])
+    parser.add_argument('--output', type=Path, default=OUTPUT_DIR / 'benchmark')
+    parser.add_argument('--baseline', action='store_true')
+    parser.add_argument('--baseline-only', action='store_true')
+    parser.add_argument('--resolutions', type=int, nargs='+', default=[512, 1024])
+    parser.add_argument('--seeds', '--seed', type=int, nargs='+', default=[SEED])
     args = parser.parse_args()
-
+    records = [record for path in args.manifest for record in load_manifest(path) if record['split'] in args.split]
+    if not records:
+        parser.error('no samples match the requested splits')
+    identities = [(r['dataset'], r['index']) for r in records]
+    if len(set(identities)) != len(identities):
+        parser.error('duplicate samples across manifests')
+    if any(split != 'validation' for split in args.split) and not (args.checkpoint or args.baseline_only):
+        parser.error('select --checkpoint explicitly for test/external evaluation')
+    checkpoints = [] if args.baseline_only else (args.checkpoint or sorted(args.checkpoints.glob('*.safetensors'), key=checkpoint_step))
+    if any(not path.is_file() for path in checkpoints):
+        parser.error('checkpoint file not found')
+    if len({p.stem for p in checkpoints}) != len(checkpoints):
+        parser.error('checkpoint names must be unique')
+    if not checkpoints and not (args.baseline or args.baseline_only):
+        parser.error('no checkpoints found; use --baseline-only for an untrained baseline')
+    if any(size < 64 for size in args.resolutions):
+        parser.error('resolutions must be at least 64')
+    if (args.output / 'results.csv').exists():
+        parser.error('results exist; choose a new --output to preserve the previous run')
     load_runtime_env()
     import torch
-    import lpips
     from diffusers import Flux2KleinPipeline
-
-    if not torch.cuda.is_available():
-        raise SystemExit("benchmark needs a CUDA GPU. Run it on the pod.")
-    records = load_manifest(args.manifest)
-    checkpoints = sorted(args.checkpoints.glob("*.safetensors"), key=lambda path: (checkpoint_step(path), path.name))
-    if not checkpoints and not args.baseline:
-        raise SystemExit(f"no checkpoints in {args.checkpoints}")
-
-    pipe = Flux2KleinPipeline.from_pretrained(DISTILLED_REPO, torch_dtype=torch.bfloat16).to("cuda")
-    lpips_fn = lpips.LPIPS(net="alex").to("cuda")
-    lpips_fn.eval()
-    for parameter in lpips_fn.parameters():
-        parameter.requires_grad_(False)
-
-    jobs: list[Path | None] = []
-    if args.baseline:
-        jobs.append(None)
-    jobs.extend(checkpoints)
-
-    args.output.mkdir(parents=True, exist_ok=True)
-    rows: list[dict] = []
     from tqdm import tqdm
-
-    work = [(ckpt, record, resolution) for ckpt in jobs for record in records for resolution in args.resolutions]
-    current_lora: Path | None = None
-    lora_loaded = False
-    sheets: dict[tuple[str, int], list] = {}
-    started = False
-    for ckpt, record, resolution in tqdm(work, unit="image"):
-        tag = "baseline" if ckpt is None else ckpt.stem
-        if not started or ckpt != current_lora:
-            if lora_loaded:
-                pipe.unload_lora_weights()
-                lora_loaded = False
-            if ckpt is not None:
-                pipe.load_lora_weights(str(ckpt), adapter_name="removal")
-                pipe.set_adapters(["removal"], adapter_weights=[1.0])
-                lora_loaded = True
-            current_lora = ckpt
-            started = True
-
-        reference, target, width, height = resize_pair(
-            Image.open(record["reference"]),
-            Image.open(record["target"]),
-            resolution,
-        )
-        try:
-            output = generate(pipe, reference, width, height, args.seed)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            print(f"OOM: {tag} {record['index']} @ {resolution}", file=sys.stderr)
-            continue
-        image_dir = args.output / "images" / tag / str(resolution)
-        image_dir.mkdir(parents=True, exist_ok=True)
-        output_path = image_dir / f"{record['index']}.png"
-        output.save(output_path)
-        metrics = score_pair(reference, output, target, lpips_fn)
-        rows.append(
-            {
-                "checkpoint": tag,
-                "step": checkpoint_step(ckpt),
-                "resolution": resolution,
-                "index": record["index"],
-                "split": record["split"],
-                "scribble_residue": "" if metrics["scribble_residue"] is None else f"{metrics['scribble_residue']:.6f}",
-                "preserve_psnr": "" if metrics["preserve_psnr"] is None else f"{metrics['preserve_psnr']:.4f}",
-                "preserve_ssim": "" if metrics["preserve_ssim"] is None else f"{metrics['preserve_ssim']:.4f}",
-                "target_lpips": f"{metrics['target_lpips']:.6f}",
-                "image": str(output_path),
-            }
-        )
-        sheets.setdefault((tag, resolution), []).append((record["index"], reference, output, target))
-
-    for (tag, resolution), triples in sheets.items():
-        contact_sheet(triples, args.output / "sheets" / f"{tag}_{resolution}.jpg")
-
-    csv_path = args.output / "results.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()) if rows else ["checkpoint"])
-        writer.writeheader()
-        writer.writerows(rows)
-    report_path = args.output / "report.md"
-    write_report(rows, report_path)
-    print(f"wrote {csv_path}")
-    print(f"wrote {report_path}")
+    if not torch.cuda.is_available():
+        raise SystemExit('benchmark needs CUDA; run on the pod')
+    pipe = Flux2KleinPipeline.from_pretrained(DISTILLED_REPO, torch_dtype=torch.bfloat16).to('cuda')
+    lpips_fn = None
+    if any(record.get('target') for record in records):
+        import lpips
+        lpips_fn = lpips.LPIPS(net='alex').to('cuda').eval()
+        for parameter in lpips_fn.parameters():
+            parameter.requires_grad_(False)
+    args.output.mkdir(parents=True, exist_ok=True)
+    config = {'model': DISTILLED_REPO, 'steps': STEPS, 'guidance': GUIDANCE,
+              'reference_order': ['original', 'reference'], 'seeds': args.seeds, 'resolutions': args.resolutions,
+              'manifests': [{'path': str(p.resolve()), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in args.manifest],
+              'checkpoints': [str(p.resolve()) for p in checkpoints]}
+    (args.output / 'run_config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+    jobs = ([None] if args.baseline or args.baseline_only else []) + checkpoints
+    rows, loaded = [], False
+    for checkpoint in jobs:
+        if loaded:
+            pipe.unload_lora_weights()
+        loaded = checkpoint is not None
+        tag = checkpoint.stem if checkpoint else 'baseline'
+        if loaded:
+            pipe.load_lora_weights(str(checkpoint), adapter_name='removal')
+            pipe.set_adapters(['removal'], adapter_weights=[1.0])
+        work = [(record, resolution, seed) for record in records
+                for resolution in dict.fromkeys(args.resolutions) for seed in dict.fromkeys(args.seeds)]
+        for record, resolution, seed in tqdm(work, desc=tag, unit='image'):
+            key = f"{record['dataset']}/{record['index']}/{resolution}/{seed}/{tag}"
+            review_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+            row = {'review_id': review_id, 'dataset': record['dataset'], 'split': record['split'],
+                   'index': record['index'], 'checkpoint': tag, 'step': checkpoint_step(checkpoint),
+                   'resolution': resolution, 'seed': seed, 'status': 'ok', 'error': '',
+                   **dict.fromkeys(METRICS, ''), 'edit_fraction': '',
+                   'original': record['original'], 'reference': record['reference'],
+                   'prompt': record['prompt'], 'image': '', 'sheet': ''}
+            try:
+                with Image.open(record['original']) as src, Image.open(record['reference']) as ref:
+                    original, reference = resize_inputs(src, ref, resolution)
+                target = None
+                if record.get('target'):
+                    with Image.open(record['target']) as image:
+                        target = image.convert('RGB').resize(original.size, Image.Resampling.LANCZOS)
+                stroke_mask = None
+                if record.get('stroke_mask'):
+                    with Image.open(record['stroke_mask']) as image:
+                        stroke_mask = np.asarray(image.convert('L').resize(original.size, Image.Resampling.NEAREST))
+                output = generate(pipe, [original, reference], record['prompt'], seed)
+                if output.size != original.size:
+                    raise ValueError(f'unexpected output dimensions {output.size}')
+                image_path = args.output / 'images' / f'{review_id}.png'
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                output.save(image_path)
+                row['image'] = str(image_path.resolve())
+                row.update({k: '' if v is None else v for k, v in
+                            score_pair(original, reference, output, target, lpips_fn, stroke_mask).items()})
+                sheet = args.output / 'sheets' / f'{review_id}.jpg'
+                contact_sheet([original, reference, output] + ([target] if target else []),
+                              'original | reference | output' + (' | target' if target else ''), sheet)
+                row['sheet'] = str(sheet.resolve())
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                row.update(status='error', error='CUDA OOM')
+            except (ValueError, OSError) as exc:
+                row.update(status='error', error=str(exc))
+            rows.append(row)
+            write_csv(args.output / 'results.csv', rows)
+    write_report(rows, args.output / 'report.md')
+    from review_benchmark import create_review
+    create_review(args.output / 'results.csv')
+    print(f'Results, report and blind review: {args.output}')
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())
