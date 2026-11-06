@@ -66,8 +66,11 @@ def load_runtime_env() -> None:
                 continue
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    os.environ.setdefault("HF_HOME", "/workspace/data")
-    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(Path(os.environ["HF_HOME"]) / "hub"))
+    os.environ.setdefault("HF_HOME", "/backup/data/art-gen")
+    os.environ.setdefault("HF_HUB_CACHE", str(Path(os.environ["HF_HOME"]) / "hub"))
+    os.environ["HUGGINGFACE_HUB_CACHE"] = os.environ["HF_HUB_CACHE"]
+    os.environ.setdefault("HF_XET_CACHE", str(Path(os.environ["HF_HOME"]) / "xet"))
+    os.environ.setdefault("HF_ASSETS_CACHE", str(Path(os.environ["HF_HOME"]) / "assets"))
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")

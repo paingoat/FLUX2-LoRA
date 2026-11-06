@@ -4,6 +4,7 @@ Train with clean original + annotated reference, supervised by an edited target.
 
 - [RunPod: template, screen, upload, setup and reconnect](core/runpod.md)
 - [Training, validation, human scoring and VIBE evaluation](core/guide.md)
+- [Single-image preservation pilot: SAM3 masks, 20 local Pico images, RTX 5090](core/preservation.md)
 
 Git contains source code, tests, mapping and text metadata. Images, imported
 `samples/`, model weights, environments, caches and outputs are kept outside Git.
