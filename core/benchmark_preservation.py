@@ -32,7 +32,7 @@ def psnr_outside(original: Image.Image, output: Image.Image, mask: Image.Image, 
     return math.inf if mse == 0 else 10 * math.log10(255 ** 2 / mse)
 
 
-def load_manifest(path: Path) -> tuple[dict, list[dict]]:
+def load_manifest(path: Path, allow_unreviewed: bool = False) -> tuple[dict, list[dict]]:
     manifest = json.loads(path.read_text(encoding='utf-8'))
     records = manifest.get('samples', [])
     if manifest.get('protocol') != 'single-image-preservation-v1' or not records:
@@ -53,8 +53,14 @@ def load_manifest(path: Path) -> tuple[dict, list[dict]]:
             raise ValueError(f'duplicate/invalid sample ID: {identity}')
         seen.add(identity)
         approval = by_id.get(identity, {})
-        if approval.get('approved') != '1' or approval.get('mask_sha256') != record['hashes']['object_mask']:
+        if approval.get('mask_sha256') != record['hashes']['object_mask']:
+            raise ValueError(f'{identity}: mask review hash differs; rebuild and review again')
+        reviewed = approval.get('approved') == '1'
+        provisional = (allow_unreviewed and record.get('mask_source') == 'existing'
+                       and approval.get('approved') == '')
+        if not reviewed and not provisional:
             raise ValueError(f'{identity}: mask pending, rejected or changed; inspect mask_review.html and approve CSV')
+        record['mask_review_status'] = 'approved' if reviewed else 'unreviewed-existing-pilot'
         paths = {}
         for key, value in record['files'].items():
             candidate = (path.parent / value).resolve()
@@ -102,13 +108,17 @@ def report(rows: list[dict], output: Path) -> None:
                 if set(group) == set(MODES) and all(row['status'] == 'ok' for row in group.values())]
     lines = ['# Single-image preservation pilot', '',
              'One clean/overlaid image per call. No LoRA, no post-compositing. '
-             'PSNR compares raw output with the clean original outside the same reviewed SAM3 mask.',
+             'PSNR compares raw output with the clean original outside the same fixed mask.',
              'All three modes use the same sample/seed pairs below. '
              'PSNR alone does not establish removal success; use review.html.', '',
              f'Complete triples: {len(complete)}/{len(grouped)}. Failed attempts: '
              f'{sum(row["status"] != "ok" for row in rows)}.', '',
              '| Mode | PSNR outside object (dB) | PSNR outside mask + 8 px (dB) |',
              '|---|---|---|']
+    sources = sorted({row.get('mask_source', 'sam3') for row in rows})
+    lines[2:2] = [f'Mask source: {", ".join(sources)}. Existing masks are repository cue/change masks, '
+                  'not precise SAM3 object masks. '
+                  f'Unreviewed attempts: {sum(row.get("mask_review_status") == "unreviewed-existing-pilot" for row in rows)}.', '']
     for mode in MODES:
         lines.append(f'| {mode} | ' + ' | '.join(aggregate([g[mode][metric] for g in complete])
                     for metric in ('preserve_psnr', 'preserve_psnr_d8')) + ' |')
@@ -138,7 +148,7 @@ def gallery(records: list[dict], rows: list[dict], output: Path) -> None:
             for image in images:
                 image.thumbnail((320, 320))
             name = f"gallery/{record['id']}_{seed}.jpg"
-            contact_sheet(images, 'original | SAM3 mask | text | scribble | mask overlay', output / name)
+            contact_sheet(images, 'original | evaluation mask | text | scribble | mask overlay', output / name)
             cards.append(f'<h2>{html.escape(record["id"])} seed={seed}</h2><img style="max-width:100%" src="{name}">')
     (output / 'gallery.html').write_text('<meta charset="utf-8"><title>Preservation pilot</title>' + ''.join(cards), encoding='utf-8')
 
@@ -150,15 +160,17 @@ def main() -> int:
     parser.add_argument('--seeds', type=int, nargs='+', default=[42])
     parser.add_argument('--limit', type=int, help='Smoke test: first N selected samples')
     parser.add_argument('--validate-only', action='store_true', help='Check assets and mask approvals without CUDA')
+    parser.add_argument('--allow-unreviewed', action='store_true', help='Provisional existing-mask pilot only; never permits rejected or unreviewed SAM3 masks')
     parser.add_argument('--offload', action='store_true', help='Use model CPU offload for every mode')
     args = parser.parse_args()
-    manifest, records = load_manifest(args.manifest.resolve())
+    manifest, records = load_manifest(args.manifest.resolve(), allow_unreviewed=args.allow_unreviewed)
     if args.limit is not None:
         if args.limit < 1:
             parser.error('--limit must be positive')
         records = records[:args.limit]
     if args.validate_only:
-        print(f'Validated {len(records)} samples; all masks approved, assets and dimensions verified')
+        print(f'Validated {len(records)} samples; assets and dimensions verified; '
+              f'{sum(r["mask_review_status"] != "approved" for r in records)} unreviewed existing masks')
         return 0
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
@@ -180,6 +192,7 @@ def main() -> int:
     config = dict(model=DISTILLED_REPO, revision=revision, steps=4, guidance=1.0, dtype='bfloat16',
                   reference_count=1, offload=args.offload, seeds=list(dict.fromkeys(args.seeds)),
                   manifest_sha256=digest(args.manifest), sample_ids=[r['id'] for r in records],
+                  mask_source=manifest['config'].get('mask_source', 'sam3'), allow_unreviewed=args.allow_unreviewed,
                   runtime=runtime, environment_lock=lock, diffusers=diffusers.__version__,
                   cache={key: value for key, value in os.environ.items()
                          if key in {'HF_HOME', 'HF_HUB_CACHE', 'HF_XET_CACHE', 'HF_ASSETS_CACHE'}})
@@ -195,6 +208,7 @@ def main() -> int:
                            index=record['id'], seed=seed, mode=mode, status='error', error='',
                            preserve_psnr='', preserve_psnr_d8='', elapsed_sec='', peak_vram_allocated_mb='',
                            mask_fraction=record['mask_fraction'], prompt=record['prompts'][mode],
+                           mask_source=record.get('mask_source', 'sam3'), mask_review_status=record['mask_review_status'],
                            image='', sheet='', checkpoint='pretrained', resolution=max(original.size))
                 try:
                     image = original if mode == 'text' else Image.open(record['paths'][mode]).convert('RGB')

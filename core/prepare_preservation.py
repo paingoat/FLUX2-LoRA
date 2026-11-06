@@ -1,4 +1,4 @@
-"""Select local Pico removal samples, segment with SAM3 and make single-image cues."""
+"""Prepare single-image cues from existing Pico masks or reviewed SAM3 predictions."""
 from __future__ import annotations
 
 import argparse
@@ -48,6 +48,8 @@ def select_samples(metadata: Path, count: int, seed: int) -> list[dict]:
             continue
         seen.add(key)
         candidates.append(dict(id=identity, original=str(original), source_sha256=digest(original),
+                               existing_mask=str((metadata.parent / row.get('mask_file_name',
+                                   str(Path(row['original_file_name']).with_name('mask.png')))).resolve()),
                                source_key=key, split=row.get('split'), object_prompt=row['prompt_object'].strip(),
                                instruction=f"Remove {row['prompt_object'].strip().rstrip('.')}. "
                                'Naturally restore the background and preserve all other content.'))
@@ -142,7 +144,8 @@ def materialize(output: Path, selection: dict, candidates: dict) -> None:
                  'scribble': 'scribble.png', 'mask': 'mask_overlay.png', 'stroke_mask': 'stroke_mask.png'}
         record = {**sample, 'files': {key: f"{sample['id']}/{name}" for key, name in files.items()},
                   'hashes': {key: digest(folder / name) for key, name in files.items()},
-                  'prompts': prompts(sample['instruction']), 'sam3': candidates[sample['id']],
+                  'prompts': prompts(sample['instruction']),
+                  'mask_source': selection.get('mask_source', 'sam3'), 'mask_provenance': candidates[sample['id']],
                   'mask_fraction': float((np.asarray(mask) > 0).mean())}
         records.append(record)
         review.append(dict(id=sample['id'], mask_sha256=record['hashes']['object_mask'], approved='', notes=''))
@@ -156,8 +159,83 @@ def materialize(output: Path, selection: dict, candidates: dict) -> None:
     cards = ''.join(f'<h2>{html.escape(r["id"])}</h2><p>{html.escape(r["object_prompt"])}</p>'
                     f'<img style="max-width:100%" src="{r["id"]}/preview.jpg">' for r in records)
     (output / 'mask_review.html').write_text('<meta charset="utf-8"><title>Mask review</title>'
-        '<h1>Original | Scribble | SAM3 mask overlay</h1><p>Inspect all masks, then set approved=1 '
+        f'<h1>Original | Scribble | {selection.get("mask_source", "sam3")} mask overlay</h1><p>Inspect all masks, then set approved=1 '
         'in mask_review.csv. Regenerating overlays resets approvals.</p>' + cards, encoding='utf-8')
+
+
+def prepare_masks(output: Path, selection: dict, overrides: dict, predictor=None, sam3_info=None) -> list[dict]:
+    """Checkpoint each success; retry only changed/failed samples, never mix mask sources."""
+    candidates_path = output / 'sam3_candidates.json'
+    candidates = json.loads(candidates_path.read_text(encoding='utf-8')) if candidates_path.exists() else {}
+    errors = []
+    mode = selection.get('mask_source', 'sam3')
+    for sample in selection['samples']:
+        folder = output / sample['id']
+        folder.mkdir(exist_ok=True)
+        try:
+            source = Path(sample['original'])
+            if digest(source) != sample['source_sha256']:
+                raise ValueError('source changed since selection')
+            with Image.open(source) as image:
+                source_size = image.size
+                original = image.convert('RGB').resize(fit_klein_size(*image.size, selection['longest']), Image.Resampling.LANCZOS)
+            override = overrides.get(sample['id'], {})
+            object_prompt = override.get('object_prompt', sample['object_prompt'])
+            mask_path = Path(sample.get('existing_mask', str(source.with_name('mask.png'))))
+            spec = dict(source=mode, original_sha256=digest(source), size=list(original.size),
+                        overrides=override, object_prompt=object_prompt,
+                        model_revision=(sam3_info or {}).get('sam3_model_revision'),
+                        code_revision=(sam3_info or {}).get('sam3_code_revision'),
+                        input_mask_sha256=digest(mask_path) if mode == 'existing' else None)
+            previous = candidates.get(sample['id'], {})
+            saved_original, saved_mask = folder / 'original.png', folder / 'object_mask.png'
+            if (previous.get('preparation') == spec and saved_mask.is_file() and saved_original.is_file()
+                    and previous.get('mask_sha256') == digest(saved_mask)
+                    and previous.get('original_sha256') == digest(saved_original)):
+                read_mask(saved_mask, original.size)
+                print(f"{sample['id']}: cached {mode} mask", flush=True)
+                continue
+            original.save(saved_original)
+            if mode == 'existing':
+                # Validate at source size, then use nearest-neighbor to keep the mask binary.
+                mask = read_mask(mask_path, source_size).resize(original.size, Image.Resampling.NEAREST)
+                provenance = dict(source='existing', input_mask=str(mask_path),
+                                  input_mask_sha256=spec['input_mask_sha256'], method='repository cue/change mask; not SAM3')
+            else:
+                result = predictor(original, object_prompt, override.get('box'))
+                scores = result['scores'].detach().float().cpu().numpy().reshape(-1)
+                masks = result['masks'].detach().cpu().numpy().reshape(-1, original.height, original.width)
+                if not len(scores):
+                    raise ValueError('SAM3 found no masks; add text/box override and rerun')
+                index = int(override.get('candidate_index', int(scores.argmax())))
+                if not 0 <= index < len(scores):
+                    raise ValueError('candidate_index out of range')
+                for i, candidate in enumerate(masks):
+                    Image.fromarray(candidate.astype(np.uint8) * 255).save(folder / f'candidate_{i}.png')
+                mask = Image.fromarray(masks[index].astype(np.uint8) * 255)
+                provenance = dict(source='sam3', environment=sam3_info, scores=scores.tolist(),
+                                  candidate_index=index, object_prompt=object_prompt, box=override.get('box'), confidence_threshold=0.5)
+                print(f"{sample['id']}: {len(scores)} masks, selected {index}", flush=True)
+            mask.save(saved_mask)
+            read_mask(saved_mask, original.size)
+            candidates[sample['id']] = dict(**provenance, preparation=spec,
+                mask_sha256=digest(saved_mask), original_sha256=digest(saved_original))
+            write_json(candidates_path, candidates)
+            if mode == 'existing':
+                print(f"{sample['id']}: existing mask prepared", flush=True)
+        except (ValueError, OSError, RuntimeError) as exc:
+            errors.append(dict(id=sample['id'], error=str(exc)))
+            print(f"{sample['id']}: ERROR {exc}", flush=True)
+            if mode == 'sam3':
+                import torch
+                torch.cuda.empty_cache()
+    with (output / 'prepare_errors.csv').open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=['id', 'error'])
+        writer.writeheader()
+        writer.writerows(errors)
+    if not errors:
+        materialize(output, selection, candidates)
+    return errors
 
 
 def main() -> int:
@@ -168,6 +246,7 @@ def main() -> int:
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--longest', type=int, default=1024)
     parser.add_argument('--alpha', type=float, default=0.4)
+    parser.add_argument('--mask-source', choices=['sam3', 'existing'], default='sam3')
     parser.add_argument('--select-only', action='store_true')
     parser.add_argument('--rebuild-overlays', action='store_true', help='Use locally corrected binary masks; resets approvals')
     parser.add_argument('--overrides', type=Path, help='JSON: sample ID -> object_prompt, candidate_index, normalized cxcywh box')
@@ -182,10 +261,14 @@ def main() -> int:
     else:
         if args.rebuild_overlays:
             parser.error('select and generate masks before rebuilding overlays')
-        selection = dict(count=args.count, seed=args.seed, longest=args.longest, alpha=args.alpha,
+        if not args.metadata.is_file():
+            parser.error(f'missing metadata: {args.metadata}. Download and extract the Pico input bundle first; see core/preservation.md')
+        selection = dict(count=args.count, seed=args.seed, longest=args.longest, alpha=args.alpha, mask_source=args.mask_source,
                          metadata_sha256=digest(args.metadata),
                          samples=select_samples(args.metadata.resolve(), args.count, args.seed))
         write_json(selection_path, selection)
+    if selection.get('mask_source', 'sam3') != args.mask_source:
+        parser.error('mask source differs from saved selection; use a new --output to keep SAM3/existing experiments separate')
     # Existing selection is authoritative: reruns cannot silently change the 20 source images.
     if args.select_only:
         print(f"Selected {len(selection['samples'])} fixed samples: {selection_path}")
@@ -196,6 +279,11 @@ def main() -> int:
         return 0
     if (output / 'manifest.json').exists():
         parser.error('prepared data exists; use a new --output, or --rebuild-overlays after correcting masks')
+    overrides = json.loads(args.overrides.read_text(encoding='utf-8')) if args.overrides else {}
+    if args.mask_source == 'existing':
+        errors = prepare_masks(output, selection, overrides)
+        print(f'{len(errors)} failures; see {output / "prepare_errors.csv"}' if errors else f'Ready: {output / "manifest.json"}')
+        return int(bool(errors))
     load_runtime_env()
     import torch
     from huggingface_hub import hf_hub_download
@@ -209,36 +297,11 @@ def main() -> int:
     torch.manual_seed(selection['seed'])
     processor = Sam3Processor(build_sam3_image_model(checkpoint_path=checkpoint, load_from_HF=False,
         device='cuda', eval_mode=True, enable_inst_interactivity=False), device='cuda', confidence_threshold=0.5)
-    overrides = json.loads(args.overrides.read_text(encoding='utf-8')) if args.overrides else {}
-    candidates = {}
-    for sample in selection['samples']:
-        folder = output / sample['id']
-        folder.mkdir(exist_ok=True)
-        source = Path(sample['original'])
-        if digest(source) != sample['source_sha256']:
-            raise ValueError(f'{source}: source changed since selection')
-        with Image.open(source) as image:
-            original = image.convert('RGB').resize(fit_klein_size(*image.size, selection['longest']), Image.Resampling.LANCZOS)
-        original.save(folder / 'original.png')
-        override = overrides.get(sample['id'], {})
-        object_prompt = override.get('object_prompt', sample['object_prompt'])
-        result = segment_image(processor, original, object_prompt, override.get('box'))
-        scores = result['scores'].detach().float().cpu().numpy().reshape(-1)
-        masks = result['masks'].detach().cpu().numpy().reshape(-1, original.height, original.width)
-        if not len(scores):
-            raise ValueError(f"{sample['id']}: SAM3 found no masks; retry with --overrides")
-        index = int(override.get('candidate_index', int(scores.argmax())))
-        if not 0 <= index < len(scores):
-            raise ValueError('candidate_index out of range')
-        for i, mask in enumerate(masks):
-            Image.fromarray(mask.astype(np.uint8) * 255).save(folder / f'candidate_{i}.png')
-        Image.fromarray(masks[index].astype(np.uint8) * 255).save(folder / 'object_mask.png')
-        candidates[sample['id']] = dict(model_revision=revision, code_revision=lock['sam3_code_revision'],
-            repository=lock['sam3_repository'], confidence_threshold=0.5, environment=lock,
-            object_prompt=object_prompt, scores=scores.tolist(), candidate_index=index, box=override.get('box'))
-        write_json(candidates_path, candidates)
-        print(f"{sample['id']}: {len(scores)} masks, selected {index}", flush=True)
-    materialize(output, selection, candidates)
+    errors = prepare_masks(output, selection, overrides,
+        predictor=lambda image, prompt, box: segment_image(processor, image, prompt, box), sam3_info=lock)
+    if errors:
+        print(f'{len(errors)} failures recorded in {output / "prepare_errors.csv"}. Fix overrides and rerun; successful masks are reused.')
+        return 1
     print(f'Review masks at {output / "mask_review.html"}; approve in mask_review.csv')
     return 0
 

@@ -109,6 +109,84 @@ class PreservationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prep.select_samples(path, 6, 42)
 
+    def test_existing_masks_run_without_sam3_and_resume_after_missing_mask(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as temp:
+            root = Path(temp)
+            samples = []
+            for i in range(2):
+                folder = root / 'sources' / str(i)
+                folder.mkdir(parents=True)
+                self.source.save(folder / 'original.png')
+                if i == 1:
+                    self.mask.save(folder / 'mask.png')
+                samples.append(dict(id=f'remove_{i}', original=str(folder / 'original.png'),
+                    source_sha256=prep.digest(folder / 'original.png'), existing_mask=str(folder / 'mask.png'),
+                    object_prompt='the cup', instruction='Remove the cup.', split='train'))
+            selection = dict(count=2, seed=42, longest=64, alpha=0.4, mask_source='existing', samples=samples)
+            out = root / 'prepared'
+            out.mkdir()
+            prep.write_json(out / 'selection.json', selection)
+            with contextlib.redirect_stdout(io.StringIO()):
+                errors = prep.prepare_masks(out, selection, {})
+            self.assertEqual([r['id'] for r in errors], ['remove_0'])
+            self.assertTrue((out / 'remove_1/object_mask.png').is_file())
+            self.assertFalse((out / 'manifest.json').exists())
+            self.mask.save(root / 'sources/0/mask.png')
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(prep.prepare_masks(out, selection, {}), [])
+            self.assertIn('remove_1: cached existing mask', stdout.getvalue())
+            _, records = bench.load_manifest(out / 'manifest.json', allow_unreviewed=True)
+            self.assertTrue(all(r['mask_source'] == 'existing' for r in records))
+            self.assertTrue(all(r['mask_review_status'] == 'unreviewed-existing-pilot' for r in records))
+            with Image.open(records[0]['paths']['object_mask']) as image:
+                self.assertEqual(image.size, (64, 64))
+            with self.assertRaisesRegex(ValueError, 'mask pending'):
+                bench.load_manifest(out / 'manifest.json')
+            with (out / 'mask_review.csv').open(newline='', encoding='utf-8') as handle:
+                review = list(csv.DictReader(handle))
+            review[0]['approved'] = '0'
+            bench.write_csv(out / 'mask_review.csv', review)
+            with self.assertRaisesRegex(ValueError, 'mask pending'):
+                bench.load_manifest(out / 'manifest.json', allow_unreviewed=True)
+
+    def test_allow_unreviewed_never_bypasses_sam3_review(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as temp:
+            data = self.prepared(Path(temp))
+            with self.assertRaisesRegex(ValueError, 'mask pending'):
+                bench.load_manifest(data / 'manifest.json', allow_unreviewed=True)
+
+    def test_sam3_no_detection_continues_and_success_is_reused(self):
+        class Tensor:
+            def __init__(self, value): self.value = np.asarray(value)
+            def detach(self): return self
+            def float(self): return self
+            def cpu(self): return self
+            def numpy(self): return self.value
+
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as temp:
+            root = Path(temp)
+            samples = []
+            for i in range(2):
+                image_path = root / f'source_{i}.png'
+                self.source.save(image_path)
+                samples.append(dict(id=f'remove_{i}', original=str(image_path),
+                    source_sha256=prep.digest(image_path), object_prompt='the cup', instruction='Remove the cup.'))
+            selection = dict(count=2, seed=42, longest=96, alpha=0.4, mask_source='sam3', samples=samples)
+            out = root / 'prepared'
+            out.mkdir()
+            prep.write_json(out / 'selection.json', selection)
+            success = dict(scores=Tensor([0.9]), masks=Tensor((np.asarray(self.mask) > 127)[None, None]))
+            empty = dict(scores=Tensor([]), masks=Tensor(np.empty((0, 1, 96, 96))))
+            predictor = Mock(side_effect=[empty, success])
+            with patch.dict(sys.modules, torch=SimpleNamespace(cuda=Mock())), contextlib.redirect_stdout(io.StringIO()):
+                errors = prep.prepare_masks(out, selection, {}, predictor, {'sam3_model_revision': 'test'})
+                self.assertEqual(len(errors), 1)
+                predictor.side_effect = [success]
+                self.assertEqual(prep.prepare_masks(out, selection, {}, predictor, {'sam3_model_revision': 'test'}), [])
+                self.assertEqual(predictor.call_count, 3)
+            self.assertTrue((out / 'manifest.json').is_file())
+
     def test_generate_passes_one_image_and_fixed_distilled_settings(self):
         fake_torch = SimpleNamespace(inference_mode=contextlib.nullcontext,
                                      Generator=Mock(return_value=Mock()))

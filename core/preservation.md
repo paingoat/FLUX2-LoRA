@@ -5,6 +5,51 @@ Ba nhánh: ảnh sạch + text; scribble đỏ overlay; SAM3 mask phủ đỏ al
 Mỗi lượt chỉ gửi một PIL image. Model mặc định là Klein 4B distilled, không LoRA,
 BF16, 4 steps, guidance 1.0, seed 42. Không ghép nền sau inference.
 
+## Chạy trước bằng mask có sẵn (không cần SAM3)
+
+Gói private `Thoandanh/flux2-preservation-pico20` có bản bổ sung
+`pico_removal_20_existing_masks.zip`: đúng 20 ảnh gốc như bản đầu, thêm mask.png và
+metadata chứa đường dẫn mask. Không dùng change_mask.png thay cho mask.png.
+
+```bash
+conda activate preservation-flux
+source core/env.sh
+hf download Thoandanh/flux2-preservation-pico20 --repo-type dataset \
+  --include 'pico_removal_20_existing_masks.zip' 'pico_removal_20_existing_masks.zip.sha256' \
+  --local-dir output/pico_existing_download
+(cd output/pico_existing_download && sha256sum -c pico_removal_20_existing_masks.zip.sha256)
+python -m zipfile -e output/pico_existing_download/pico_removal_20_existing_masks.zip .
+
+python core/prepare_preservation.py --mask-source existing --output output/preservation_existing_data
+python core/benchmark_preservation.py --manifest output/preservation_existing_data/manifest.json \
+  --allow-unreviewed --validate-only
+python core/benchmark_preservation.py --manifest output/preservation_existing_data/manifest.json \
+  --allow-unreviewed --limit 2 --output output/preservation_existing_smoke
+python core/benchmark_preservation.py --manifest output/preservation_existing_data/manifest.json \
+  --allow-unreviewed --output output/preservation_existing_20
+```
+
+Mask được kiểm tra binary/diện tích/kích thước trước khi resize nearest-neighbor.
+Chế độ existing chạy CPU, không import SAM3 hoặc tải SAM3 weights. Chọn output riêng
+để giữ nguyên lần chạy SAM3 cũ. Selection cố định mask_source, không chuyển nguồn
+mask trong cùng selection. Cả ba nhánh dùng cùng mask để chấm.
+
+`--allow-unreviewed` chỉ cho phép pilot với existing mask chưa được duyệt; report/CSV
+ghi rõ `unreviewed-existing-pilot`. Không cho phép mask đã đánh rejected hoặc SAM3
+mask chưa được duyệt. Có thể mở mask_review.html rồi đặt approved=1 ở mask_review.csv,
+sau đó bỏ flag này. Mask có sẵn là cue/change mask từ pipeline SIGMA, không phải
+ground truth vật thể chính xác: PSNR pilot chỉ để kiểm tra pipeline và xem xu hướng.
+
+## Khôi phục khi SAM3 không tìm được mask
+
+Phiên bản mới xử lý tiếp các mẫu còn lại, lưu từng mask thành công và liệt kê lỗi
+ở `prepare_errors.csv`. Không tạo manifest hoàn chỉnh nếu vẫn thiếu mẫu; không
+âm thầm lấy mask cũ thay cho SAM3. Sửa overrides rồi chạy lại cùng lệnh/output.
+Những mask thành công có cùng nguồn ảnh, revision và overrides được tái sử dụng;
+đổi override của một mẫu chỉ tính lại mẫu đó. Mask từ script cũ chưa có thông tin
+resume sẽ tính lại một lần. `pkg_resources` và `timm` deprecation warnings không
+phải lỗi forward; giữ setuptools pin, không cần sửa để chạy ảnh.
+
 ## 1. Chuẩn bị máy Linux RTX 5090
 
 Chạy từ thư mục repo chứa `core/` và `samples/`. Cần Conda sẵn trên PATH, Git,
