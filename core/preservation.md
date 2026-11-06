@@ -5,6 +5,35 @@ Ba nhánh: ảnh sạch + text; scribble đỏ overlay; SAM3 mask phủ đỏ al
 Mỗi lượt chỉ gửi một PIL image. Model mặc định là Klein 4B distilled, không LoRA,
 BF16, 4 steps, guidance 1.0, seed 42. Không ghép nền sau inference.
 
+## Prompt protocol spatial-only-v2
+
+Chỉ nhánh text dùng mô tả vật thể từ metadata. Hai nhánh overlay dùng câu cố định
+giống nhau giữa mọi ảnh, không nối instruction hoặc prompt_object vào prompt FLUX:
+
+- Text: `Remove {prompt_object}. Naturally restore the background and preserve all other content.`
+- Scribble: `Remove the object indicated by the red loop. Naturally restore the background, remove the annotation, and preserve all other content.`
+- Mask: `Remove the object highlighted by the translucent red region. Naturally restore the background, remove the annotation, and preserve all other content.`
+
+SAM3 vẫn có thể dùng object_prompt ở bước chuẩn bị mask; FLUX chỉ nhận ảnh overlay
+và câu cố định ở hai nhánh spatial. Đây là so sánh text xác định vật thể với spatial
+guidance xác định vật thể. Benchmark kiểm tra version và nội dung prompt, từ chối
+manifest cũ còn mô tả vật thể trong scribble/mask. Version được ghi trong run_config.
+
+Nếu đã chuẩn bị existing mask ở phiên bản trước, không cần tải/tạo mask lại:
+
+```bash
+python core/prepare_preservation.py --mask-source existing \
+  --output output/preservation_existing_data --rebuild-overlays
+python core/benchmark_preservation.py --manifest output/preservation_existing_data/manifest.json \
+  --allow-unreviewed --limit 2 --output output/preservation_existing_smoke_v2
+python core/benchmark_preservation.py --manifest output/preservation_existing_data/manifest.json \
+  --allow-unreviewed --output output/preservation_existing_20_v2
+```
+
+Rebuild cập nhật prompt trong manifest và reset mask approvals. Dùng thư mục run mới
+để giữ kết quả cũ. Chạy lại đủ cả ba nhánh trên cùng selection và seed, không gộp
+điểm từ protocol cũ và mới.
+
 ## Chạy trước bằng mask có sẵn (không cần SAM3)
 
 Gói private `Thoandanh/flux2-preservation-pico20` có bản bổ sung

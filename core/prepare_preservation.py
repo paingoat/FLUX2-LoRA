@@ -17,6 +17,7 @@ from common import REPO_ROOT, fit_klein_size, load_runtime_env
 
 DEFAULT_OUTPUT = REPO_ROOT / 'output/preservation_data'
 MODES = ('text', 'scribble', 'mask')
+PROMPT_PROTOCOL = 'spatial-only-v2'
 
 
 def digest(path: Path) -> str:
@@ -105,8 +106,10 @@ def overlays(original: Image.Image, mask: Image.Image, alpha: float = 0.4):
 
 def prompts(instruction: str) -> dict[str, str]:
     return {'text': instruction,
-            'scribble': instruction + ' The red loop identifies the object to remove. Remove the annotation too.',
-            'mask': instruction + ' The translucent red region identifies the object to remove. Remove the annotation too.'}
+            'scribble': 'Remove the object indicated by the red loop. Naturally restore the background, '
+                        'remove the annotation, and preserve all other content.',
+            'mask': 'Remove the object highlighted by the translucent red region. Naturally restore the background, '
+                    'remove the annotation, and preserve all other content.'}
 
 
 def segment_image(processor, image: Image.Image, object_prompt: str, box=None):
@@ -150,6 +153,7 @@ def materialize(output: Path, selection: dict, candidates: dict) -> None:
         records.append(record)
         review.append(dict(id=sample['id'], mask_sha256=record['hashes']['object_mask'], approved='', notes=''))
     write_json(output / 'manifest.json', {'protocol': 'single-image-preservation-v1',
+               'prompt_protocol': PROMPT_PROTOCOL,
                'selection_sha256': digest(output / 'selection.json'), 'config': {k: v for k, v in selection.items() if k != 'samples'},
                'samples': records})
     with (output / 'mask_review.csv').open('w', newline='', encoding='utf-8') as handle:

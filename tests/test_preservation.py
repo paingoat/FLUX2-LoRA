@@ -80,6 +80,31 @@ class PreservationTests(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(tint)[40, 40], [162, 72, 84])
         self.assertEqual(scribble.tobytes(), prep.overlays(self.source, self.mask)[0].tobytes())
 
+    def test_overlay_prompts_never_include_object_metadata(self):
+        cup = prep.prompts('Remove the distinctive purple cup.')
+        person = prep.prompts('Remove the blonde-haired person on the left.')
+        self.assertNotEqual(cup['text'], person['text'])
+        for mode in ('scribble', 'mask'):
+            self.assertEqual(cup[mode], person[mode])
+            self.assertNotIn('purple', cup[mode])
+            self.assertNotIn('blonde', person[mode])
+
+    def test_legacy_or_leaking_prompt_manifest_is_rejected(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as temp:
+            data = self.prepared(Path(temp))
+            self.approve(data)
+            path = data / 'manifest.json'
+            manifest = json.loads(path.read_text(encoding='utf-8'))
+            del manifest['prompt_protocol']
+            prep.write_json(path, manifest)
+            with self.assertRaisesRegex(ValueError, 'old prompt protocol'):
+                bench.load_manifest(path)
+            manifest['prompt_protocol'] = prep.PROMPT_PROTOCOL
+            manifest['samples'][0]['prompts']['mask'] += ' Remove the cup.'
+            prep.write_json(path, manifest)
+            with self.assertRaisesRegex(ValueError, 'prompts differ'):
+                bench.load_manifest(path)
+
     def test_review_gate_and_hash_changes(self):
         with tempfile.TemporaryDirectory(dir=self.temp_root) as temp:
             data = self.prepared(Path(temp))
