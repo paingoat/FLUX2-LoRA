@@ -56,6 +56,9 @@ mà model_builder nạp. Pin NumPy <2 và OpenCV 4.11 để tránh xung đột r
 Setuptools 80.9 giữ pkg_resources mà upstream vẫn dùng để tìm BPE vocabulary.
 Torch cu128 trên Linux cung cấp Triton; preflight kiểm tra import Triton và
 cả model_builder/image processor. Không cài Gradio vì benchmark không dùng UI server.
+Không cài decord: đây là dependency của video loader được import khi gọi đọc video,
+không dùng trong thí nghiệm ảnh. Setup tự gỡ decord khỏi môi trường preservation-sam3
+nếu đã được cài bởi phiên bản script cũ, để tránh lỗi platform tag từ pip check.
 
 HF_HOME mới có thể chưa chứa token đã login ở cache cũ. Đặt HF_TOKEN trong .env
 hoặc `source core/env.sh` rồi `hf auth login` dưới đúng cache này; không phải xin lại quyền.

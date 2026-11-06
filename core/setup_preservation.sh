@@ -49,6 +49,9 @@ for kind in sam3 flux; do
   python -m pip install --upgrade pip
   python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
   if [[ "$kind" == sam3 ]]; then
+    # Earlier pilot setup installed decord; its old wheel can fail modern pip check.
+    # The image grounding path never calls the optional video loader that uses it.
+    python -m pip uninstall -y decord
     python -m pip install -r "$CORE_DIR/requirements-preservation-sam3.txt"
     python -m pip install -c "$CORE_DIR/requirements-preservation-sam3.txt" "$SAM3_SOURCE"
     python -m pip check
