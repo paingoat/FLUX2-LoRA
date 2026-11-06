@@ -5,12 +5,13 @@ Ba nhánh: ảnh sạch + text; scribble đỏ overlay; SAM3 mask phủ đỏ al
 Mỗi lượt chỉ gửi một PIL image. Model mặc định là Klein 4B distilled, không LoRA,
 BF16, 4 steps, guidance 1.0, seed 42. Không ghép nền sau inference.
 
-## Prompt protocol spatial-only-v2
+## Prompt protocol dataset-text-spatial-only-v3
 
-Chỉ nhánh text dùng mô tả vật thể từ metadata. Hai nhánh overlay dùng câu cố định
+Nhánh text dùng nguyên văn prompt_original từ dataset, giữ mọi thuộc tính/vị trí
+và yêu cầu khôi phục nền; không viết lại hoặc nối thêm câu. Hai nhánh overlay dùng câu cố định
 giống nhau giữa mọi ảnh, không nối instruction hoặc prompt_object vào prompt FLUX:
 
-- Text: `Remove {prompt_object}. Naturally restore the background and preserve all other content.`
+- Text: nguyên văn `prompt_original` của từng mẫu trong metadata.jsonl.
 - Scribble: `Remove the object indicated by the red loop. Naturally restore the background, remove the annotation, and preserve all other content.`
 - Mask: `Remove the object highlighted by the translucent red region. Naturally restore the background, remove the annotation, and preserve all other content.`
 
@@ -25,14 +26,16 @@ Nếu đã chuẩn bị existing mask ở phiên bản trước, không cần t�
 python core/prepare_preservation.py --mask-source existing \
   --output output/preservation_existing_data --rebuild-overlays
 python core/benchmark_preservation.py --manifest output/preservation_existing_data/manifest.json \
-  --allow-unreviewed --limit 2 --output output/preservation_existing_smoke_v2
+  --allow-unreviewed --limit 2 --output output/preservation_existing_smoke_v3
 python core/benchmark_preservation.py --manifest output/preservation_existing_data/manifest.json \
-  --allow-unreviewed --output output/preservation_existing_20_v2
+  --allow-unreviewed --output output/preservation_existing_20_v3
 ```
 
 Rebuild cập nhật prompt trong manifest và reset mask approvals. Dùng thư mục run mới
 để giữ kết quả cũ. Chạy lại đủ cả ba nhánh trên cùng selection và seed, không gộp
-điểm từ protocol cũ và mới.
+điểm từ protocol cũ và mới. Rebuild đọc lại prompt_original từ metadata.jsonl cho đúng
+các ID đã chọn, không bốc lại 20 ảnh. Nếu thiếu prompt_original thì báo lỗi, không
+tự rút gọn về tên vật thể.
 
 ## Chạy trước bằng mask có sẵn (không cần SAM3)
 
@@ -152,11 +155,12 @@ cấu hình trong file này. Muốn đổi seed/count/resolution/alpha hãy dùn
 Mặc định cạnh dài 1024, giữ tỷ lệ rồi làm tròn theo Klein; SAM3 chạy trên đúng ảnh
 đã resize, nên mask và ảnh đều ở cùng hệ tọa độ. Không dùng mask SIGMA cũ.
 
-Instruction được tạo từ mô tả vật thể `prompt_object`, tránh prompt_short có
-"inside the oval" ở nhánh text. SAM3 chọn mask confidence cao nhất làm **ứng viên**;
+Instruction nhánh text lấy nguyên văn `prompt_original` của dataset, không dùng
+prompt_short. SAM3 dùng prompt_object riêng ở bước chuẩn bị mask, không đưa mô tả
+đó vào prompt FLUX của scribble/mask. SAM3 chọn mask confidence cao nhất làm **ứng viên**;
 người duyệt phải xác nhận đúng vật thể, đủ phần và không ăn sang vật thể bên cạnh.
-Nếu mô tả vật thể mơ hồ, sửa instruction/object_prompt trong selection trước khi
-tạo mask; chọn thư mục output mới nếu dữ liệu đã được duyệt.
+Nếu mô tả vật thể cho SAM3 mơ hồ, sửa object_prompt bằng overrides khi tạo mask;
+instruction nhánh text vẫn giữ nguyên dataset. Chọn output mới nếu dữ liệu đã được duyệt.
 
 Nếu SAM3 không tìm được hoặc chọn sai instance, tạo overrides JSON rồi chạy lại
 trước khi manifest đã hoàn tất:

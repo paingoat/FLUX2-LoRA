@@ -17,7 +17,7 @@ from common import REPO_ROOT, fit_klein_size, load_runtime_env
 
 DEFAULT_OUTPUT = REPO_ROOT / 'output/preservation_data'
 MODES = ('text', 'scribble', 'mask')
-PROMPT_PROTOCOL = 'spatial-only-v2'
+PROMPT_PROTOCOL = 'dataset-text-spatial-only-v3'
 
 
 def digest(path: Path) -> str:
@@ -47,18 +47,43 @@ def select_samples(metadata: Path, count: int, seed: int) -> list[dict]:
         original = (metadata.parent / row['original_file_name']).resolve()
         if not original.is_file() or not row.get('prompt_object', '').strip():
             continue
+        instruction = row.get('prompt_original')
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError(f'{identity}: missing prompt_original; restore the dataset metadata (no shortened fallback)')
         seen.add(key)
         candidates.append(dict(id=identity, original=str(original), source_sha256=digest(original),
                                existing_mask=str((metadata.parent / row.get('mask_file_name',
                                    str(Path(row['original_file_name']).with_name('mask.png')))).resolve()),
                                source_key=key, split=row.get('split'), object_prompt=row['prompt_object'].strip(),
-                               instruction=f"Remove {row['prompt_object'].strip().rstrip('.')}. "
-                               'Naturally restore the background and preserve all other content.'))
+                               instruction=instruction, prompt_original=instruction))
     candidates.sort(key=lambda row: row['id'])
     random.Random(seed).shuffle(candidates)
     if len(candidates) < count:
         raise ValueError(f'only {len(candidates)} unique usable removal samples, requested {count}')
     return candidates[:count]
+
+
+def refresh_original_instructions(selection: dict, metadata: Path) -> None:
+    """Migrate prompts of fixed samples from local dataset metadata without reselecting images."""
+    if not metadata.is_file():
+        raise ValueError(f'missing metadata: {metadata}; restore metadata.jsonl from the input bundle')
+    by_id = {}
+    for line in metadata.read_text(encoding='utf-8').splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row['id'] in by_id:
+            raise ValueError(f'duplicate metadata ID: {row["id"]}')
+        by_id[row['id']] = row
+    instructions = []
+    for sample in selection['samples']:
+        instruction = by_id.get(sample['id'], {}).get('prompt_original')
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError(f'{sample["id"]}: missing prompt_original in dataset metadata')
+        instructions.append(instruction)
+    for sample, instruction in zip(selection['samples'], instructions):
+        sample.update(instruction=instruction, prompt_original=instruction)
+    selection['prompt_metadata_sha256'] = digest(metadata)
 
 
 def read_mask(path: Path, size: tuple[int, int]) -> Image.Image:
@@ -279,10 +304,14 @@ def main() -> int:
         return 0
     candidates_path = output / 'sam3_candidates.json'
     if args.rebuild_overlays:
+        refresh_original_instructions(selection, args.metadata)
+        write_json(selection_path, selection)
         materialize(output, selection, json.loads(candidates_path.read_text(encoding='utf-8')))
         return 0
     if (output / 'manifest.json').exists():
         parser.error('prepared data exists; use a new --output, or --rebuild-overlays after correcting masks')
+    refresh_original_instructions(selection, args.metadata)
+    write_json(selection_path, selection)
     overrides = json.loads(args.overrides.read_text(encoding='utf-8')) if args.overrides else {}
     if args.mask_source == 'existing':
         errors = prepare_masks(output, selection, overrides)

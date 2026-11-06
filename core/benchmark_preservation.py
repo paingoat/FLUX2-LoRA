@@ -79,7 +79,10 @@ def load_manifest(path: Path, allow_unreviewed: bool = False) -> tuple[dict, lis
             with Image.open(paths[key]) as image:
                 if image.size != size:
                     raise ValueError(f'{identity}/{key}: dimensions differ')
-        if record['prompts'] != prompts(record['instruction']):
+        if (not isinstance(record.get('prompt_original'), str) or not record['prompt_original'].strip()
+                or record['instruction'] != record['prompt_original']):
+            raise ValueError('text must use the unchanged dataset prompt_original; regenerate manifest')
+        if record['prompts'] != prompts(record['prompt_original']):
             raise ValueError('prompts differ from spatial-only protocol; regenerate manifest with --rebuild-overlays')
         record['paths'] = paths
     return manifest, records
@@ -112,7 +115,8 @@ def report(rows: list[dict], output: Path) -> None:
     lines = ['# Single-image preservation pilot', '',
              'One clean/overlaid image per call. No LoRA, no post-compositing. '
              'PSNR compares raw output with the clean original outside the same fixed mask.',
-             'Prompt protocol: spatial-only-v2. Only text names the object; scribble/mask use fixed spatial instructions.',
+             f'Prompt protocol: {PROMPT_PROTOCOL}. Text uses the unchanged dataset prompt_original; '
+             'scribble/mask use fixed spatial instructions without object metadata.',
              'All three modes use the same sample/seed pairs below. '
              'PSNR alone does not establish removal success; use review.html.', '',
              f'Complete triples: {len(complete)}/{len(grouped)}. Failed attempts: '
@@ -195,6 +199,7 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     config = dict(model=DISTILLED_REPO, revision=revision, steps=4, guidance=1.0, dtype='bfloat16',
                   prompt_protocol=PROMPT_PROTOCOL,
+                  text_prompt_source='dataset.prompt_original',
                   reference_count=1, offload=args.offload, seeds=list(dict.fromkeys(args.seeds)),
                   manifest_sha256=digest(args.manifest), sample_ids=[r['id'] for r in records],
                   mask_source=manifest['config'].get('mask_source', 'sam3'), allow_unreviewed=args.allow_unreviewed,

@@ -38,7 +38,8 @@ class PreservationTests(unittest.TestCase):
         folder.mkdir(parents=True)
         self.source.save(folder / 'original.png')
         self.mask.save(folder / 'object_mask.png')
-        sample = dict(id='remove_1', object_prompt='the cup', instruction='Remove the cup.', split='train')
+        sample = dict(id='remove_1', object_prompt='the cup', instruction='Remove the cup.',
+                      prompt_original='Remove the cup.', split='train')
         selection = dict(count=1, seed=42, longest=96, alpha=0.4, samples=[sample])
         prep.write_json(data / 'selection.json', selection)
         prep.materialize(data, selection, {'remove_1': {'model_revision': 'test', 'code_revision': 'test'}})
@@ -89,6 +90,24 @@ class PreservationTests(unittest.TestCase):
             self.assertNotIn('purple', cup[mode])
             self.assertNotIn('blonde', person[mode])
 
+    def test_refresh_uses_exact_dataset_text_without_reselecting_samples(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as temp:
+            metadata = Path(temp) / 'metadata.jsonl'
+            original = '  Remove the cup on the LEFT.\nRestore the table, keeping the book unchanged.  '
+            metadata.write_text(json.dumps(dict(id='fixed_id', prompt_original=original)), encoding='utf-8')
+            selection = {'samples': [dict(id='fixed_id', instruction='Remove the cup.', original='unchanged.png')]}
+            prep.refresh_original_instructions(selection, metadata)
+            sample = selection['samples'][0]
+            self.assertEqual(sample['instruction'], original)
+            self.assertEqual(sample['prompt_original'], original)
+            self.assertEqual(sample['id'], 'fixed_id')
+            self.assertEqual(sample['original'], 'unchanged.png')
+            self.assertEqual(prep.prompts(original)['text'], original)
+            metadata.write_text(json.dumps(dict(id='fixed_id', prompt_object='the cup')), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'missing prompt_original'):
+                prep.refresh_original_instructions(selection, metadata)
+            self.assertEqual(sample['instruction'], original)
+
     def test_legacy_or_leaking_prompt_manifest_is_rejected(self):
         with tempfile.TemporaryDirectory(dir=self.temp_root) as temp:
             data = self.prepared(Path(temp))
@@ -123,7 +142,8 @@ class PreservationTests(unittest.TestCase):
             self.source.save(root / 'source.png')
             rows = [dict(id=f'remove_{i}', operation='remove', review_status='auto_accepted',
                          original_file_name='source.png', source_key=f'source_{i}',
-                         prompt_object='the cup', prompt_short='Remove inside the oval.') for i in range(5)]
+                         prompt_object='the cup', prompt_short='Remove inside the oval.',
+                         prompt_original='Remove the cup on the table and restore its shadow.\nKeep the rest unchanged.') for i in range(5)]
             rows.append({**rows[0], 'id': 'duplicate_source'})
             path = root / 'metadata.jsonl'
             path.write_text('\n'.join(json.dumps(r) for r in rows), encoding='utf-8')
@@ -131,6 +151,7 @@ class PreservationTests(unittest.TestCase):
             self.assertEqual(a, b)
             self.assertEqual(len({r['source_key'] for r in a}), 5)
             self.assertNotIn('oval', a[0]['instruction'])
+            self.assertEqual(a[0]['instruction'], rows[0]['prompt_original'])
             with self.assertRaises(ValueError):
                 prep.select_samples(path, 6, 42)
 
@@ -146,7 +167,7 @@ class PreservationTests(unittest.TestCase):
                     self.mask.save(folder / 'mask.png')
                 samples.append(dict(id=f'remove_{i}', original=str(folder / 'original.png'),
                     source_sha256=prep.digest(folder / 'original.png'), existing_mask=str(folder / 'mask.png'),
-                    object_prompt='the cup', instruction='Remove the cup.', split='train'))
+                    object_prompt='the cup', instruction='Remove the cup.', prompt_original='Remove the cup.', split='train'))
             selection = dict(count=2, seed=42, longest=64, alpha=0.4, mask_source='existing', samples=samples)
             out = root / 'prepared'
             out.mkdir()
@@ -196,7 +217,7 @@ class PreservationTests(unittest.TestCase):
                 image_path = root / f'source_{i}.png'
                 self.source.save(image_path)
                 samples.append(dict(id=f'remove_{i}', original=str(image_path),
-                    source_sha256=prep.digest(image_path), object_prompt='the cup', instruction='Remove the cup.'))
+                    source_sha256=prep.digest(image_path), object_prompt='the cup', instruction='Remove the cup.', prompt_original='Remove the cup.'))
             selection = dict(count=2, seed=42, longest=96, alpha=0.4, mask_source='sam3', samples=samples)
             out = root / 'prepared'
             out.mkdir()
