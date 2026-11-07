@@ -25,14 +25,24 @@ import run_region_trainer
 
 class RegionLossTests(unittest.TestCase):
     def test_text_cache_batch_is_one_before_entering_trainer(self):
-        mixins = SimpleNamespace(TEXT_EMBED_CACHE_BATCH=16)
+        class CacheItem:
+            def get_text_embedding_info_dict(self, caption_override=None, **kwargs):
+                return {'caption': caption_override or 'remove object'}
+        mixins = SimpleNamespace(TEXT_EMBED_CACHE_BATCH=16, TextEmbeddingFileItemDTOMixin=CacheItem)
         with patch.dict(sys.modules, {'toolkit': SimpleNamespace(dataloader_mixins=mixins)}), \
-                patch.dict('os.environ', {'FLUX_REGION_SEED': '42'}), \
+                patch.dict('os.environ', {'FLUX_REGION_SEED': '42', 'FLUX_REGION_TE_CACHE_TAG': 'bf16'}), \
                 patch.object(sys, 'argv', ['run_region_trainer.py', 'config.yaml']), \
                 patch.object(run_region_trainer.runpy, 'run_path') as run:
             run.side_effect = lambda *args, **kwargs: self.assertEqual(mixins.TEXT_EMBED_CACHE_BATCH, 1)
             run_region_trainer.main()
             run.assert_called_once_with('run.py', run_name='__main__')
+            info = CacheItem().get_text_embedding_info_dict(caption_override='different caption', text_only=True)
+            self.assertEqual(info, {'caption': 'different caption', 'region_text_encoder_config': 'bf16'})
+            bf16_hash = hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()
+            with patch.dict('os.environ', {'FLUX_REGION_TE_CACHE_TAG': 'fp8'}):
+                run_region_trainer.configure_text_cache()
+            fp8_info = CacheItem().get_text_embedding_info_dict(caption_override='different caption', text_only=True)
+            self.assertNotEqual(bf16_hash, hashlib.sha256(json.dumps(fp8_info, sort_keys=True).encode()).hexdigest())
 
     def test_training_progress_does_not_count_preparation_bars(self):
         self.assertIsNone(train.parse_trainer_line('Caching text embeddings to disk: 60%|###| 51/85 [00:12]'))
@@ -105,6 +115,8 @@ class RegionLossTests(unittest.TestCase):
         a,b = copy.deepcopy(configs)
         self.assertEqual(a['region_loss']['strength'], 0)
         self.assertEqual(b['region_loss']['strength'], 1.5)
+        self.assertIs(a['config']['process'][0]['model']['quantize_te'], False)
+        self.assertEqual(a['config']['process'][0]['model']['te_dtype'], 'bf16')
         a['region_loss']['strength'] = b['region_loss']['strength']
         a['config']['name'] = b['config']['name']
         self.assertEqual(a,b)

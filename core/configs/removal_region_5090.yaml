@@ -45,7 +45,9 @@ config:
     model:
       name_or_path: black-forest-labs/FLUX.2-klein-base-4B
       arch: flux2_klein_4b
-      quantize_te: true
+      # Avoid Quanto QLinear parameter swaps when Qwen3 moves CPU <-> CUDA.
+      quantize_te: false
+      te_dtype: bf16
       model_kwargs:
         match_target_res: true
       low_vram: true

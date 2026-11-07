@@ -286,6 +286,12 @@ def main() -> int:
     env.pop('FLUX_REGION_STRENGTH', None)
     if region_loss is not None:
         env['FLUX_REGION_STRENGTH'] = str(strength)
+        model = process_config['model']
+        env['FLUX_REGION_TE_CACHE_TAG'] = json.dumps(dict(
+            version=1, quantize_te=model.get('quantize_te', model.get('quantize', False)),
+            qtype_te=model.get('qtype_te', 'qfloat8'),
+            dtype=model.get('te_dtype', process_config['train']['dtype']),
+        ), sort_keys=True)
         env['PYTHONPATH'] = str(Path(__file__).resolve().parent) + os.pathsep + env.get('PYTHONPATH', '')
         info = dict(region_loss=region_loss,
                     trainer_sha256=hashlib.sha256(trainer_file.read_bytes()).hexdigest(),

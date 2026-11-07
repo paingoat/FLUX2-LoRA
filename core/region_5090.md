@@ -14,7 +14,20 @@ Launcher giới hạn text embedding cache còn 1 prompt mỗi forward cho cả 
 Giá trị này độc lập với train.batch_size=1 và gradient accumulation=4.
 Toolkit được pin mặc định cache 16 prompt; đã quan sát OOM 31.34 GiB trên RTX
 5090 ngay lúc cache Qwen3, trước bước train. Không cần cài lại env hoặc đổi loss
-để nhận bản sửa: pull code mới rồi chạy lại. Cache đã ghi vẫn được dùng lại.
+để nhận bản sửa: pull code mới rồi chạy lại. Latent cache đã ghi vẫn dùng lại.
+
+Qwen3 dùng **BF16 không quantize** (`quantize_te: false`, `te_dtype: bf16`) ở
+cả hai config để tránh lỗi `_apply(): Couldn't swap QLinear.weight` khi chuyển
+weight Quanto giữa CPU/CUDA. Giữ low_vram, cache batch 1 và unload text encoder
+sau cache. Qwen3 vẫn frozen; không bật gradient cho text encoder.
+BF16 dùng thêm bộ nhớ cho text encoder so với FP8; mức VRAM thực tế cần kiểm
+tra trên GPU. Loss và thiết lập LoRA không đổi.
+
+Cache text embedding được thêm cấu hình precision/quantization vào hash.
+Vì vậy cache FP8 cũ không bị dùng lẫn BF16 mới; không xóa cache cũ và không
+tải lại weights. Lần đầu sau bản sửa sẽ tính lại text embeddings. Không cần
+chạy lại setup, prepare_dataset hoặc prepare_region_masks. Dùng config trong
+`core/configs/`; config local đã copy trước đây không tự được cập nhật khi pull.
 
 Môi trường PSNR/SAM3 cũ được giữ riêng. Code chỉ được kiểm tra CPU ở local;
 setup Linux, dependencies, optimizer CUDA và VRAM full model cần bạn xác nhận
