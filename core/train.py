@@ -158,7 +158,7 @@ def validate_region_dataset(dataset: dict) -> Path:
 
 def parse_trainer_line(line: str) -> dict[str, int | float] | None:
     match = STEP_RE.search(line)
-    if match is None or "loss:" not in line and "|" not in line:
+    if match is None or "loss:" not in line:
         return None
     parsed: dict[str, int | float] = {"step": int(match.group(1)), "total": int(match.group(2))}
     loss_match = LOSS_RE.search(line)

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,9 +20,25 @@ from region_loss import region_weights
 import prepare_region_masks as masks
 import train
 import patch_region_trainer as trainer_patch
+import run_region_trainer
 
 
 class RegionLossTests(unittest.TestCase):
+    def test_text_cache_batch_is_one_before_entering_trainer(self):
+        mixins = SimpleNamespace(TEXT_EMBED_CACHE_BATCH=16)
+        with patch.dict(sys.modules, {'toolkit': SimpleNamespace(dataloader_mixins=mixins)}), \
+                patch.dict('os.environ', {'FLUX_REGION_SEED': '42'}), \
+                patch.object(sys, 'argv', ['run_region_trainer.py', 'config.yaml']), \
+                patch.object(run_region_trainer.runpy, 'run_path') as run:
+            run.side_effect = lambda *args, **kwargs: self.assertEqual(mixins.TEXT_EMBED_CACHE_BATCH, 1)
+            run_region_trainer.main()
+            run.assert_called_once_with('run.py', run_name='__main__')
+
+    def test_training_progress_does_not_count_preparation_bars(self):
+        self.assertIsNone(train.parse_trainer_line('Caching text embeddings to disk: 60%|###| 51/85 [00:12]'))
+        self.assertIsNone(train.parse_trainer_line('Caching latents: 100%|###| 85/85 [00:12]'))
+        self.assertEqual(train.parse_trainer_line('removal_region: 2%|#| 1/50 [00:01, loss: 0.123]')['step'], 1)
+
     def test_weights_loss_and_gradient_match_hand_calculation(self):
         pred = torch.tensor([[[[1., 2.], [3., 4.]]]], requires_grad=True)
         mask = torch.tensor([[[[0., 1.], [0., 1.]]]])

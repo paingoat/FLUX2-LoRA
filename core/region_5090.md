@@ -10,6 +10,11 @@ Nền có trọng số 1; vùng ưu tiên tối đa 2.5. Mask được broadcast
 Không chia trọng số cho trung bình mask. Target vẫn là `noise - target_latent`.
 Hai run bắt đầu độc lập từ base, không resume checkpoint của nhau.
 Loss mới có thể lớn hơn vì đổi trọng số; không chọn checkpoint bằng loss train A/B.
+Launcher giới hạn text embedding cache còn 1 prompt mỗi forward cho cả A/B.
+Giá trị này độc lập với train.batch_size=1 và gradient accumulation=4.
+Toolkit được pin mặc định cache 16 prompt; đã quan sát OOM 31.34 GiB trên RTX
+5090 ngay lúc cache Qwen3, trước bước train. Không cần cài lại env hoặc đổi loss
+để nhận bản sửa: pull code mới rồi chạy lại. Cache đã ghi vẫn được dùng lại.
 
 Môi trường PSNR/SAM3 cũ được giữ riêng. Code chỉ được kiểm tra CPU ở local;
 setup Linux, dependencies, optimizer CUDA và VRAM full model cần bạn xác nhận
