@@ -12,8 +12,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATASET_DIR = REPO_ROOT / "data" / "removal_dataset"
-PREPARED_DIR = Path(os.environ.get("REMOVAL_PREPARED", "/workspace/datasets/removal_dual"))
-OUTPUT_DIR = Path(os.environ.get("REMOVAL_OUTPUT", "/workspace/output/removal_dual_4b"))
+PREPARED_DIR = Path(os.environ.get("REMOVAL_PREPARED", str(REPO_ROOT / ".local/removal_dual"))).expanduser().resolve()
+OUTPUT_DIR = Path(os.environ.get("REMOVAL_OUTPUT", str(REPO_ROOT / "output/removal_dual_4b"))).expanduser().resolve()
 AITOOLKIT_DIR = Path(os.environ.get("AITOOLKIT", "/workspace/ai-toolkit"))
 TRAIN_CONFIG = REPO_ROOT / "core" / "configs" / "removal_scribble_4b.yaml"
 

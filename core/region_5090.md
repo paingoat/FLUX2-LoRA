@@ -15,71 +15,75 @@ Môi trường PSNR/SAM3 cũ được giữ riêng. Code chỉ được kiểm t
 setup Linux, dependencies, optimizer CUDA và VRAM full model cần bạn xác nhận
 trên RTX 5090. Không có smoke test hoặc train GPU nào đã được chạy thay bạn.
 
-## 1. Đưa code và dữ liệu lên máy
+## 1. Cập nhật checkout đang có
 
-Clone riêng nhánh thử nghiệm từ GitHub:
-
-```bash
-cd /workspace
-git clone --depth 1 --single-branch --branch experiment/region-weighted-loss-5090 \
-  https://github.com/paingoat/FLUX2-LoRA.git FLUX2-LoRA-region
-cd /workspace/FLUX2-LoRA-region
-```
-
-Trong các lệnh bên dưới, nếu dùng thư mục clone này thì thay
-`/workspace/FLUX2-LoRA` bằng `/workspace/FLUX2-LoRA-region`.
-Nếu dùng checkout đã có, lưu thay đổi riêng của bạn trước khi chuyển nhánh.
-
-Gói `.local/region_5090_code.zip` chứa code hiện tại (không có `.env`, weights,
-ảnh hoặc `.git`). Có thể upload gói này và `.sha256` lên `/workspace` rồi chạy:
+Dùng repo hiện có trên máy bạn, không clone lồng thêm thư mục:
 
 ```bash
-cd /workspace
-sha256sum -c region_5090_code.zip.sha256
-mkdir -p /workspace/FLUX2-LoRA
-unzip -o region_5090_code.zip -d /workspace/FLUX2-LoRA
+cd ~/project/mix-modality/FLUX2-LoRA
+git status --short
+git fetch origin refs/heads/experiment/region-weighted-loss-5090:refs/remotes/origin/experiment/region-weighted-loss-5090
+git switch experiment/region-weighted-loss-5090
+git pull --ff-only origin experiment/region-weighted-loss-5090
 ```
 
-Giải nén vào checkout dành riêng cho thử nghiệm nếu trên máy đang có code khác
-chưa lưu. Gói zip không tạo Git branch trên máy đích.
+Nếu chưa có local branch, `git switch` tự tạo từ remote branch vừa fetch.
+Nếu Git báo local changes bị ghi đè, giữ lại thay đổi của bạn trước khi switch;
+không dùng reset hard. Những lần sau trên đúng nhánh chỉ cần `git pull --ff-only`.
+Git không đưa `.env`, ảnh, cache hoặc outputs lên remote nên các file đó vẫn giữ
+trong checkout đang dùng. Env Conda và cache ngoài repo cũng dùng lại được.
 
-Dataset archive cũ **không chứa mask**. Tại repo local, đóng gói lại:
+Nếu đã clone lồng `FLUX2-LoRA-region/`, kiểm tra `.env`, `data/`, `.local/` và
+`output/` trong thư mục con trước khi xóa; giữ hoặc chuyển những file cần dùng.
+Không cần xóa thư mục con để fetch/switch/pull repo cha.
 
-```powershell
-python core/package_dataset.py --include-masks --output .local/removal_region_dataset.tar.gz
-```
+Config trên GitHub tự resolve đường dẫn theo repo. Mặc định:
 
-Upload `.tar.gz` và `.sha256` lên `/workspace`, rồi trên máy GPU:
+- Dữ liệu đã chuẩn bị: `<repo>/.local/removal_dual`.
+- Checkpoint/log: `<repo>/output/<tên-run>`.
+- `${REMOVAL_PREPARED}` và `${REMOVAL_TRAINING_FOLDER}` trong YAML được wrapper
+  thay bằng đường dẫn tuyệt đối trước khi chạy AI Toolkit.
+
+Không cần tạo `.local/configs` hoặc chạy đoạn Python sửa đường dẫn. Dùng trực
+tiếp `core/configs/removal_region_5090.yaml` và `removal_uniform_5090.yaml`.
+Có thể đặt hai biến trên trong `.env` để dùng lại đường dẫn dữ liệu/output cũ;
+source `core/env.sh` trước khi chuẩn bị dữ liệu hoặc train để các script nhất quán.
+Đường dẫn tuyệt đối cũ trong config local vẫn được giữ nguyên.
+Nếu terminal còn biến export trỏ vào thư mục clone con, bỏ chúng trước khi source
+để nhận mặc định của repo cha (hoặc giá trị bạn đã ghi trong `.env`):
 
 ```bash
-cd /workspace
-sha256sum -c removal_region_dataset.tar.gz.sha256
-tar -xzf removal_region_dataset.tar.gz -C /workspace/FLUX2-LoRA
-cd /workspace/FLUX2-LoRA
+unset REMOVAL_PREPARED REMOVAL_TRAINING_FOLDER
+source core/env.sh
+printf 'Prepared: %s\nOutput: %s\n' "$REMOVAL_PREPARED" "$REMOVAL_TRAINING_FOLDER"
 ```
 
-Archive chứa bộ original/reference/target/caption và `mask/<index>.png` sẵn có.
-Không cần upload toàn bộ Pico hoặc chạy SAM3 lại. Nếu đã có dữ liệu đúng trên
-máy, chỉ cần bảo đảm thư mục `data/removal_dataset/mask/` có đủ mask.
-
-### Tải archive từ Hugging Face
+### Dữ liệu từ Hugging Face
 
 Repo dữ liệu private: `Thoandanh/flux2-klein-removal-dual`.
-Sau khi setup env ở mục 2 (để có CLI `hf`), tải đúng hai file, tránh tải lại
-toàn bộ repo dữ liệu:
+Sau khi setup env ở mục 2 (để có CLI `hf`), tải đúng hai file:
 
 ```bash
+REPO_DIR="$(git rev-parse --show-toplevel)"
 hf download Thoandanh/flux2-klein-removal-dual \
   removal_region_dataset.tar.gz removal_region_dataset.tar.gz.sha256 \
-  --repo-type dataset --local-dir /workspace
-cd /workspace
+  --repo-type dataset --local-dir "$REPO_DIR/.local/download"
+cd "$REPO_DIR/.local/download"
 sha256sum -c removal_region_dataset.tar.gz.sha256
-tar -xzf removal_region_dataset.tar.gz -C /workspace/FLUX2-LoRA-region
-cd /workspace/FLUX2-LoRA-region
+cd "$REPO_DIR"
 ```
 
-Dùng HF_TOKEN trong `.env` của tài khoản có quyền đọc repo, hoặc `hf auth login`.
-Nếu cache/dataset đã có đủ thì bỏ bước download tương ứng.
+Chỉ khi checksum báo OK:
+
+```bash
+tar -xzf .local/download/removal_region_dataset.tar.gz -C .
+```
+
+Archive có 100 original/reference/target/caption và `mask/<index>.png` sẵn có.
+Không cần upload toàn bộ Pico hoặc chạy SAM3 lại. Nếu dữ liệu đúng đã có ở
+`data/removal_dataset/`, bỏ bước download/giải nén; kiểm tra có đủ `mask/`.
+HF_TOKEN trong `.env` cần quyền đọc repo; hoặc bỏ dòng HF_TOKEN placeholder
+và dùng `hf auth login` trên máy GPU. Đăng nhập local không tự truyền sang GPU.
 
 ## 2. Setup riêng cho RTX 5090
 
@@ -88,14 +92,14 @@ model/text encoder và env. Dùng `screen` để giữ tiến trình khi SSH ng�
 
 ```bash
 screen -S region-train
-cd /workspace/FLUX2-LoRA
+cd ~/project/mix-modality/FLUX2-LoRA
 cp -n .env.example .env
 # Sửa HF_TOKEN và các đường dẫn cache trong .env.
 # Dùng /backup/data/art-gen nếu đã mount cache của pilot PSNR ở đây.
-# Nếu Pod chỉ có /workspace persistent: HF_HOME=/workspace/art-gen,
+# Nếu cache nằm ở chỗ khác, đặt HF_HOME đúng mount đó,
 # và đổi cả HF_HUB_CACHE, HF_XET_CACHE, HF_ASSETS_CACHE tương ứng.
 set -o pipefail
-bash core/setup_region_5090.sh 2>&1 | tee /workspace/setup-region.log
+bash core/setup_region_5090.sh 2>&1 | tee setup-region.log
 ```
 
 Setup tạo `klein-region-5090`, Python 3.12, FFmpeg 7, torch/torchaudio 2.8.0,
@@ -113,7 +117,7 @@ Lưu `region-packages.txt`, `region-runtime.json` trong `$CONDA_PREFIX` cùng k�
 Mỗi lần mở terminal mới:
 
 ```bash
-cd /workspace/FLUX2-LoRA
+cd ~/project/mix-modality/FLUX2-LoRA
 source "$(conda info --base)/etc/profile.d/conda.sh"
 source core/env.sh
 conda activate klein-region-5090
@@ -143,6 +147,9 @@ python core/prepare_dataset.py
 python core/prepare_region_masks.py
 ```
 
+Chỉ chuẩn bị một lần cho cùng dữ liệu và đường dẫn checkout. Khi train lại trong
+cùng checkout với dữ liệu không đổi, bỏ qua hai lệnh trên; không ghi đè mask cũ.
+
 Thực hiện bước prepare_dataset trước khi tạo region masks. Nếu chạy lại prepare
 hoặc thay ảnh, tạo lại mask bằng `--output` mới và cập nhật `mask_path` trong cả
 hai config. Không xóa thư mục kết quả cũ; script từ chối ghi đè output đã tồn tại.
@@ -159,7 +166,7 @@ chính xác cách dilation 50 px của paper. Mask đi qua cùng scale/crop/flip
 target trong loader AI Toolkit rồi được nội suy về latent; loader còn có blur
 mask nhẹ mặc định nên biên có trọng số mềm trong [1, 2.5].
 
-Kết quả tại `/workspace/datasets/removal_dual/region_loss/`:
+Kết quả tại `$REMOVAL_PREPARED/region_loss/` (mặc định `.local/removal_dual/region_loss/`):
 
 - `train/`: mask loss của **train split**.
 - `preview/`: vùng loss tô tím trên ảnh gốc; xem trước để kiểm tra mask đúng.
@@ -179,6 +186,16 @@ python core/train.py --config core/configs/removal_uniform_5090.yaml --check-onl
 python core/train.py --config core/configs/removal_region_5090.yaml --check-only
 ```
 
+Nếu muốn thử 50 bước trước, chạy riêng lệnh sau. Output nằm ở
+`$REMOVAL_TRAINING_FOLDER/removal_region_5090_smoke/`, tách khỏi full run:
+
+```bash
+python core/train.py --config core/configs/removal_region_5090.yaml --smoke-steps 50
+```
+
+Lượt smoke mới không ghi đè checkpoint smoke đã có. Nếu thư mục đó đã có
+checkpoint, giữ kết quả và dùng tên run mới trong một bản config thử nghiệm.
+
 Chạy tuần tự, một process train trên GPU:
 
 ```bash
@@ -190,8 +207,8 @@ Muốn thử loss mới trước, chạy riêng lệnh thứ hai. Khi cần kế
 chạy đối chứng A. Các run dùng seed 42 cho Python/NumPy/Torch; cùng seed không
 bảo đảm bitwise deterministic giữa các máy hoặc khi resume.
 
-Outputs: `/workspace/output/removal_uniform_5090/` và
-`/workspace/output/removal_region_5090/`, checkpoint mỗi 250 steps, log,
+Outputs mặc định: `output/removal_uniform_5090/` và
+`output/removal_region_5090/`, checkpoint mỗi 250 steps, log,
 resolved config và `experiment.json`. Resume đúng config bằng `--resume`;
 wrapper từ chối nối checkpoint khi config/loss, mask provenance hoặc trainer đổi.
 AI Toolkit resume không đảm bảo khôi phục chính xác trạng thái RNG/dataloader.
@@ -207,18 +224,18 @@ base và LPIPS weights vào cache; cần mạng. Đánh giá chính trên **base
 
 ```bash
 python core/benchmark.py --model base --steps 50 --guidance 4 --offload \
-  --manifest /workspace/datasets/removal_dual/region_loss/eval_manifest.json \
+  --manifest "$REMOVAL_PREPARED/region_loss/eval_manifest.json" \
   --split validation --baseline \
-  --checkpoints /workspace/output/removal_uniform_5090 \
+  --checkpoints "$REMOVAL_TRAINING_FOLDER/removal_uniform_5090" \
   --resolutions 512 --seeds 42 123 2026 \
-  --output /workspace/output/region_eval_A_validation
+  --output "$REMOVAL_TRAINING_FOLDER/region_eval_A_validation"
 
 python core/benchmark.py --model base --steps 50 --guidance 4 --offload \
-  --manifest /workspace/datasets/removal_dual/region_loss/eval_manifest.json \
+  --manifest "$REMOVAL_PREPARED/region_loss/eval_manifest.json" \
   --split validation --baseline \
-  --checkpoints /workspace/output/removal_region_5090 \
+  --checkpoints "$REMOVAL_TRAINING_FOLDER/removal_region_5090" \
   --resolutions 512 --seeds 42 123 2026 \
-  --output /workspace/output/region_eval_B_validation
+  --output "$REMOVAL_TRAINING_FOLDER/region_eval_B_validation"
 ```
 
 `results.csv`, `report.md`, `review.html` gồm:
@@ -239,12 +256,12 @@ Sau đó đánh giá hai checkpoint đã chọn trên test, dùng tên file th�
 
 ```bash
 python core/benchmark.py --model base --steps 50 --guidance 4 --offload \
-  --manifest /workspace/datasets/removal_dual/region_loss/eval_manifest.json \
+  --manifest "$REMOVAL_PREPARED/region_loss/eval_manifest.json" \
   --split test --baseline \
-  --checkpoint /workspace/output/removal_uniform_5090/CHOSEN_A.safetensors \
-               /workspace/output/removal_region_5090/CHOSEN_B.safetensors \
+  --checkpoint "$REMOVAL_TRAINING_FOLDER/removal_uniform_5090/CHOSEN_A.safetensors" \
+               "$REMOVAL_TRAINING_FOLDER/removal_region_5090/CHOSEN_B.safetensors" \
   --resolutions 512 1024 --seeds 42 123 2026 \
-  --output /workspace/output/region_eval_test
+  --output "$REMOVAL_TRAINING_FOLDER/region_eval_test"
 ```
 
 Mỗi lần chạy dùng output mới. Không so trung bình nếu coverage thành công khác
@@ -252,7 +269,7 @@ nhau. PSNR cao với ảnh không xóa gì không phải kết quả tốt.
 Chấm và export `review.csv` từ review.html, rồi tổng hợp theo
 [guide.md](guide.md). VIBE Removal dùng [quy trình chuẩn bị hiện có](guide.md#5-test-nội-bộ-và-vibe-removal),
 chạy benchmark với `--model base --steps 50 --guidance 4 --offload`,
-`--split external --manifest /workspace/datasets/vibe_removal/manifest.json`
+`--split external --manifest /path/to/vibe_removal/manifest.json`
 và hai `--checkpoint` đã chọn, output riêng. VIBE chưa có mask vật thể chuẩn
 trong pipeline này: metric vùng ngoài dựa trên hình học annotation, báo riêng
 với test nội bộ. Human review là rubric dự án, không phải VIBE leaderboard judge.

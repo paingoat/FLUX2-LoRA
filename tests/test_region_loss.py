@@ -96,6 +96,24 @@ class RegionLossTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             trainer_patch.patched_source('class SDTrainer: pass')
 
+    def test_portable_config_uses_repo_paths_and_custom_output(self):
+        original = yaml.safe_load((ROOT/'core/configs/removal_region_5090.yaml').read_text())
+        with tempfile.TemporaryDirectory(dir=ROOT / '.local') as temp:
+            root = Path(temp) / 'repo with spaces'
+            prepared = root / '.local/removal_dual'
+            with patch.object(train, 'REPO_ROOT', root), patch.object(train, 'PREPARED_DIR', prepared), \
+                    patch.dict('os.environ', {'REMOVAL_TRAINING_FOLDER': str(root/'custom output')}):
+                resolved = train.resolve_training_paths(copy.deepcopy(original))
+                process = resolved['config']['process'][0]
+                self.assertEqual(Path(process['training_folder']), root/'custom output')
+                self.assertEqual(Path(process['datasets'][0]['mask_path']), prepared/'region_loss/train')
+                self.assertEqual(Path(process['sample']['samples'][0]['ctrl_img_1']), prepared/'sample_controls/0015_original.png')
+                self.assertNotIn('${', yaml.safe_dump(resolved))
+                self.assertEqual(train.resolve_training_paths(copy.deepcopy(resolved)), resolved)
+                process['training_folder'] = '${UNKNOWN_PATH}/output'
+                with self.assertRaisesRegex(ValueError, 'unknown path variable'):
+                    train.resolve_training_paths(resolved)
+
     def test_region_metric_excludes_edit_and_detects_background_damage(self):
         import benchmark
         class PerceptualStub(torch.nn.Module):

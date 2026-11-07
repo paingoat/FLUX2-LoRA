@@ -25,6 +25,7 @@ from common import (
     BASE_REPO,
     OUTPUT_DIR,
     PREPARED_DIR,
+    REPO_ROOT,
     PROMPT,
     REFERENCE_ORDER,
     TEXT_ENCODER_REPO,
@@ -41,6 +42,29 @@ STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 LOSS_RE = re.compile(r"\bloss:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
 SAVE_RE = re.compile(r"Saving at step\s+(\d+)")
 FIELD_RE = re.compile(r"(?m)^\s*(steps|save_every):\s*(\d+)\s*$")
+
+
+def resolve_training_paths(config: dict) -> dict:
+    """Resolve portable config paths before the external trainer changes cwd."""
+    variables = {
+        '${REMOVAL_PREPARED}': str(PREPARED_DIR),
+        '${REMOVAL_TRAINING_FOLDER}': os.environ.get('REMOVAL_TRAINING_FOLDER', str(REPO_ROOT / 'output')),
+    }
+    for process in config['config']['process']:
+        fields = [(process, 'training_folder')]
+        for dataset in process.get('datasets', []):
+            fields.extend((dataset, key) for key in ('folder_path', 'control_path_1', 'control_path_2', 'mask_path') if dataset.get(key))
+        for sample in process.get('sample', {}).get('samples', []):
+            fields.extend((sample, key) for key in ('ctrl_img_1', 'ctrl_img_2') if sample.get(key))
+        for item, key in fields:
+            value = item[key]
+            for token, replacement in variables.items():
+                value = value.replace(token, replacement)
+            if '${' in value:
+                raise ValueError(f'unknown path variable in {key}: {value}')
+            path = Path(value).expanduser()
+            item[key] = str((path if path.is_absolute() else REPO_ROOT / path).resolve())
+    return config
 
 
 def config_numbers(text: str) -> dict[str, int]:
@@ -197,7 +221,8 @@ def main() -> int:
     load_runtime_env()
     config_text = args.config.read_text(encoding="utf-8")
     import yaml
-    config = yaml.safe_load(config_text)
+    config = resolve_training_paths(yaml.safe_load(config_text))
+    config_text = yaml.safe_dump(config, sort_keys=False)
     if args.smoke_steps is not None:
         if args.smoke_steps < 1 or args.resume:
             parser.error("--smoke-steps must be positive and cannot be combined with --resume")

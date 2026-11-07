@@ -3,7 +3,7 @@ config:
   name: removal_uniform_5090
   process:
   - type: sd_trainer
-    training_folder: /workspace/output
+    training_folder: ${REMOVAL_TRAINING_FOLDER}
     device: cuda:0
     network:
       type: lora
@@ -15,16 +15,16 @@ config:
       max_step_saves_to_keep: 6
       push_to_hub: false
     datasets:
-    - folder_path: /workspace/datasets/removal_dual/target
-      control_path_1: /workspace/datasets/removal_dual/original
-      control_path_2: /workspace/datasets/removal_dual/reference
+    - folder_path: ${REMOVAL_PREPARED}/target
+      control_path_1: ${REMOVAL_PREPARED}/original
+      control_path_2: ${REMOVAL_PREPARED}/reference
       caption_ext: txt
       caption_dropout_rate: 0.05
       shuffle_tokens: false
       cache_latents_to_disk: true
       resolution:
       - 512
-      mask_path: /workspace/datasets/removal_dual/region_loss/train
+      mask_path: ${REMOVAL_PREPARED}/region_loss/train
       mask_min_value: 0.0
       buckets: true
       cache_text_embeddings: true
@@ -66,29 +66,29 @@ config:
           2 as spatial guidance. Do not reproduce the annotation strokes in the output.
           Preserve content outside the requested edit. Editing instruction: Remove
           the object inside the red circle and naturally restore the background.'
-        ctrl_img_1: /workspace/datasets/removal_dual/sample_controls/0015_original.png
-        ctrl_img_2: /workspace/datasets/removal_dual/sample_controls/0015.png
+        ctrl_img_1: ${REMOVAL_PREPARED}/sample_controls/0015_original.png
+        ctrl_img_2: ${REMOVAL_PREPARED}/sample_controls/0015.png
       - prompt: 'Image 1 is the original image to edit. Image 2 is the same image
           with annotations indicating the edit. Use image 1 as the source and image
           2 as spatial guidance. Do not reproduce the annotation strokes in the output.
           Preserve content outside the requested edit. Editing instruction: Remove
           the object inside the red circle and naturally restore the background.'
-        ctrl_img_1: /workspace/datasets/removal_dual/sample_controls/0022_original.png
-        ctrl_img_2: /workspace/datasets/removal_dual/sample_controls/0022.png
+        ctrl_img_1: ${REMOVAL_PREPARED}/sample_controls/0022_original.png
+        ctrl_img_2: ${REMOVAL_PREPARED}/sample_controls/0022.png
       - prompt: 'Image 1 is the original image to edit. Image 2 is the same image
           with annotations indicating the edit. Use image 1 as the source and image
           2 as spatial guidance. Do not reproduce the annotation strokes in the output.
           Preserve content outside the requested edit. Editing instruction: Remove
           the object inside the red circle and naturally restore the background.'
-        ctrl_img_1: /workspace/datasets/removal_dual/sample_controls/0040_original.png
-        ctrl_img_2: /workspace/datasets/removal_dual/sample_controls/0040.png
+        ctrl_img_1: ${REMOVAL_PREPARED}/sample_controls/0040_original.png
+        ctrl_img_2: ${REMOVAL_PREPARED}/sample_controls/0040.png
       - prompt: 'Image 1 is the original image to edit. Image 2 is the same image
           with annotations indicating the edit. Use image 1 as the source and image
           2 as spatial guidance. Do not reproduce the annotation strokes in the output.
           Preserve content outside the requested edit. Editing instruction: Remove
           the object inside the red circle and naturally restore the background.'
-        ctrl_img_1: /workspace/datasets/removal_dual/sample_controls/0057_original.png
-        ctrl_img_2: /workspace/datasets/removal_dual/sample_controls/0057.png
+        ctrl_img_1: ${REMOVAL_PREPARED}/sample_controls/0057_original.png
+        ctrl_img_2: ${REMOVAL_PREPARED}/sample_controls/0057.png
 meta:
   name: '[name]'
   version: '1.0'
