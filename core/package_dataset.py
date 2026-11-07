@@ -8,7 +8,7 @@ from common import DATASET_DIR, REPO_ROOT
 from prepare_dataset import check_pair, dataset_file, load_rows
 
 
-def package(dataset: Path, output: Path) -> Path:
+def package(dataset: Path, output: Path, include_masks: bool = False) -> Path:
     dataset = dataset.resolve()
     output = output.resolve()
     if output.is_relative_to(dataset):
@@ -21,6 +21,11 @@ def package(dataset: Path, output: Path) -> Path:
         if not original.is_file():
             raise ValueError(f"missing {original}; map originals first")
         paths.add(original)
+        if include_masks:
+            mask = dataset / 'mask' / f"{row['index']}.png"
+            if not mask.is_file():
+                raise ValueError(f'missing mapped mask: {mask}')
+            paths.add(mask)
     if not rows:
         raise ValueError("empty mapping")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -41,5 +46,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=DATASET_DIR)
     parser.add_argument("--output", type=Path, default=REPO_ROOT / ".local/removal_dataset.tar.gz")
+    parser.add_argument('--include-masks', action='store_true', help='include existing masks for region loss')
     args = parser.parse_args()
-    package(args.dataset, args.output)
+    package(args.dataset, args.output, args.include_masks)

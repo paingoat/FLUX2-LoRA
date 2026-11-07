@@ -6,14 +6,16 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import time
 
 import numpy as np
 from PIL import Image, ImageDraw
-from common import (DISTILLED_REPO, OUTPUT_DIR, PREPARED_DIR, PROMPT,
+from common import (BASE_REPO, DISTILLED_REPO, OUTPUT_DIR, PREPARED_DIR, PROMPT,
                     assert_not_old_removal, edit_prompt, load_runtime_env, resize_inputs)
 
 GUIDANCE, STEPS, SEED = 4.0, 4, 42
-METRICS = ('scribble_residue', 'preserve_psnr', 'preserve_ssim', 'target_lpips', 'edit_lpips')
+METRICS = ('scribble_residue', 'preserve_psnr', 'preserve_psnr_d8', 'preserve_ssim',
+           'preserve_lpips_composite', 'target_lpips', 'edit_lpips')
 
 
 def load_manifest(path: Path) -> list[dict]:
@@ -29,7 +31,7 @@ def load_manifest(path: Path) -> list[dict]:
         identities.add(identity)
         if record['split'] not in {'validation', 'test', 'external'}:
             raise ValueError('benchmark accepts held-out data only')
-        for key in ('original', 'reference', 'target', 'stroke_mask'):
+        for key in ('original', 'reference', 'target', 'stroke_mask', 'region_mask'):
             if record.get(key):
                 candidate = Path(record[key])
                 if not candidate.is_absolute():
@@ -77,7 +79,7 @@ def masked_ssim(original: np.ndarray, output: np.ndarray, edit: np.ndarray) -> f
 
 
 def score_pair(original: Image.Image, reference: Image.Image, output: Image.Image,
-               target: Image.Image | None, lpips_fn=None, stroke_mask=None) -> dict:
+               target: Image.Image | None, lpips_fn=None, stroke_mask=None, region_mask=None) -> dict:
     src, ref, out = [np.asarray(image.convert('RGB')) for image in (original, reference, output)]
     if src.shape != ref.shape or src.shape != out.shape:
         raise ValueError('metric images must have identical dimensions')
@@ -85,7 +87,9 @@ def score_pair(original: Image.Image, reference: Image.Image, output: Image.Imag
     stroke = difference > 8 if stroke_mask is None else np.asarray(stroke_mask) > 127
     if stroke.shape != src.shape[:2]:
         raise ValueError('stroke mask size differs from original')
-    edit = edit_region(stroke)
+    edit = edit_region(stroke) if region_mask is None else np.asarray(region_mask) > 127
+    if edit.shape != src.shape[:2]:
+        raise ValueError('region mask size differs from original')
     result = dict.fromkeys(METRICS)
     result['edit_fraction'] = float(edit.mean())
     if stroke.any():
@@ -93,10 +97,14 @@ def score_pair(original: Image.Image, reference: Image.Image, output: Image.Imag
         strong_stroke = stroke & (difference >= 40)
         if strong_stroke.any():
             result['scribble_residue'] = float((marker_distance[strong_stroke] <= 30).mean())
-    if stroke.any() and 0 < edit.mean() < 0.9:
+    if 0 < edit.mean() < 0.9:
         result['preserve_psnr'] = psnr(src[~edit], out[~edit])
         result['preserve_ssim'] = masked_ssim(src, out, edit)
-    if target is not None and lpips_fn is not None:
+        import cv2
+        padded = cv2.dilate(edit.astype(np.uint8), np.ones((17, 17), np.uint8)).astype(bool)
+        if (~padded).any():
+            result['preserve_psnr_d8'] = psnr(src[~padded], out[~padded])
+    if lpips_fn is not None:
         import torch
         device = next(lpips_fn.parameters()).device
         def distance(a, b):
@@ -109,14 +117,21 @@ def score_pair(original: Image.Image, reference: Image.Image, output: Image.Imag
                 return torch.from_numpy(data).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1
             with torch.inference_mode():
                 return float(lpips_fn(tensor(a), tensor(b)).item())
-        tgt = np.asarray(target.convert('RGB'))
-        if tgt.shape != out.shape:
-            raise ValueError('target size differs from output')
-        result['target_lpips'] = distance(out, tgt)
-        if stroke.any() and edit.any():
-            ys, xs = np.where(edit)
-            crop = np.s_[ys.min():ys.max()+1, xs.min():xs.max()+1]
-            result['edit_lpips'] = distance(out[crop], tgt[crop])
+        if 0 < edit.mean() < 0.9:
+            # A perceptual background surrogate, not pixel-masked LPIPS:
+            # replace the edit with source pixels before comparing whole images.
+            background = out.copy()
+            background[edit] = src[edit]
+            result['preserve_lpips_composite'] = distance(background, src)
+        if target is not None:
+            tgt = np.asarray(target.convert('RGB'))
+            if tgt.shape != out.shape:
+                raise ValueError('target size differs from output')
+            result['target_lpips'] = distance(out, tgt)
+            if edit.any():
+                ys, xs = np.where(edit)
+                crop = np.s_[ys.min():ys.max()+1, xs.min():xs.max()+1]
+                result['edit_lpips'] = distance(out[crop], tgt[crop])
     return result
 
 
@@ -165,10 +180,10 @@ def write_report(rows: list[dict], destination: Path) -> None:
              'Original + annotated reference; identical prompts and seeds for baseline and LoRA.',
              'Choose checkpoints using internal validation only. Test and VIBE are final evaluation.',
              'Automatic metrics do not establish removal success. Complete the blind human review.',
-             'Preservation uses clean original outside a region estimated from annotation geometry.',
+             'Preservation uses explicit region masks when supplied, otherwise annotation geometry estimates.',
              'LPIPS is advisory: targets can differ outside the edit. Missing targets stay blank.', '',
-             '| Dataset | Split | Checkpoint | Resolution | OK/attempted | Residue ↓ | PSNR ↑ | SSIM ↑ | LPIPS ↓ | Edit crop LPIPS ↓ |',
-             '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+             '| Dataset | Split | Checkpoint | Resolution | OK/attempted | Residue ↓ | PSNR ↑ | PSNR +8px ↑ | SSIM ↑ | Background composite LPIPS ↓ | Target LPIPS ↓ | Edit crop LPIPS ↓ |',
+             '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for key, items in sorted(grouped.items()):
         ok = [row for row in items if row['status'] == 'ok']
         values = []
@@ -178,16 +193,18 @@ def write_report(rows: list[dict], destination: Path) -> None:
         lines.append('| ' + ' | '.join(map(str, key)) + f' | {len(ok)}/{len(items)} | ' + ' | '.join(values) + ' |')
     lines += ['', 'Do not compare means if runs have different successful sample coverage.',
               'Residue counts marker-like colors at original stroke positions; displaced strokes are not detected.',
-              'Edit LPIPS uses a bounding crop with context, not pixel-masked LPIPS.']
+              'Edit LPIPS uses a bounding crop with context, not pixel-masked LPIPS.',
+              'Background composite LPIPS replaces the edit region with source pixels in the output before whole-image comparison.',
+              'Timing and peak allocated CUDA memory are per inference and exclude metric computation; see results.csv.']
     destination.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
-def generate(pipe, images, prompt: str, seed: int) -> Image.Image:
+def generate(pipe, images, prompt: str, seed: int, steps=STEPS, guidance=GUIDANCE) -> Image.Image:
     import torch
     generator = torch.Generator(device='cuda').manual_seed(seed)
     with torch.inference_mode():
-        return pipe(prompt=prompt, image=images, num_inference_steps=STEPS,
-                    guidance_scale=GUIDANCE, width=images[0].width, height=images[0].height,
+        return pipe(prompt=prompt, image=images, num_inference_steps=steps,
+                    guidance_scale=guidance, width=images[0].width, height=images[0].height,
                     generator=generator).images[0]
 
 
@@ -202,7 +219,15 @@ def main() -> int:
     parser.add_argument('--baseline-only', action='store_true')
     parser.add_argument('--resolutions', type=int, nargs='+', default=[512, 1024])
     parser.add_argument('--seeds', '--seed', type=int, nargs='+', default=[SEED])
+    parser.add_argument('--model', choices=['base', 'distilled'], default='distilled')
+    parser.add_argument('--steps', type=int, help='default: base 50, distilled 4')
+    parser.add_argument('--guidance', type=float, help='default: base 4, distilled 1')
+    parser.add_argument('--offload', action='store_true', help='model CPU offload for 32 GB GPU')
     args = parser.parse_args()
+    steps = args.steps if args.steps is not None else (50 if args.model == 'base' else 4)
+    guidance = args.guidance if args.guidance is not None else GUIDANCE
+    if steps < 1 or not np.isfinite(guidance) or guidance < 0:
+        parser.error('steps must be positive and guidance finite/nonnegative')
     records = [record for path in args.manifest for record in load_manifest(path) if record['split'] in args.split]
     if not records:
         parser.error('no samples match the requested splits')
@@ -228,15 +253,22 @@ def main() -> int:
     from tqdm import tqdm
     if not torch.cuda.is_available():
         raise SystemExit('benchmark needs CUDA; run on the pod')
-    pipe = Flux2KleinPipeline.from_pretrained(DISTILLED_REPO, torch_dtype=torch.bfloat16).to('cuda')
+    model_repo = BASE_REPO if args.model == 'base' else DISTILLED_REPO
+    pipe = Flux2KleinPipeline.from_pretrained(model_repo, torch_dtype=torch.bfloat16)
+    if args.offload:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to('cuda')
     lpips_fn = None
-    if any(record.get('target') for record in records):
+    if records:
         import lpips
         lpips_fn = lpips.LPIPS(net='alex').to('cuda').eval()
         for parameter in lpips_fn.parameters():
             parameter.requires_grad_(False)
     args.output.mkdir(parents=True, exist_ok=True)
-    config = {'model': DISTILLED_REPO, 'steps': STEPS, 'guidance': GUIDANCE,
+    config = {'model': model_repo, 'steps': steps, 'guidance': guidance, 'offload': args.offload,
+              'preserve_lpips_definition': 'LPIPS on output with edit region replaced by source pixels; background surrogate',
+              'mask_definition': 'explicit region_mask when supplied, otherwise annotation geometry estimate',
               'reference_order': ['original', 'reference'], 'seeds': args.seeds, 'resolutions': args.resolutions,
               'manifests': [{'path': str(p.resolve()), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in args.manifest],
               'checkpoints': [str(p.resolve()) for p in checkpoints]}
@@ -259,6 +291,7 @@ def main() -> int:
             row = {'review_id': review_id, 'dataset': record['dataset'], 'split': record['split'],
                    'index': record['index'], 'checkpoint': tag, 'step': checkpoint_step(checkpoint),
                    'resolution': resolution, 'seed': seed, 'status': 'ok', 'error': '',
+                   'inference_seconds': '', 'peak_allocated_gib': '',
                    **dict.fromkeys(METRICS, ''), 'edit_fraction': '',
                    'original': record['original'], 'reference': record['reference'],
                    'prompt': record['prompt'], 'image': '', 'sheet': ''}
@@ -273,7 +306,17 @@ def main() -> int:
                 if record.get('stroke_mask'):
                     with Image.open(record['stroke_mask']) as image:
                         stroke_mask = np.asarray(image.convert('L').resize(original.size, Image.Resampling.NEAREST))
-                output = generate(pipe, [original, reference], record['prompt'], seed)
+                region_mask = None
+                if record.get('region_mask'):
+                    with Image.open(record['region_mask']) as image:
+                        region_mask = np.asarray(image.convert('L').resize(original.size, Image.Resampling.NEAREST))
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                started = time.perf_counter()
+                output = generate(pipe, [original, reference], record['prompt'], seed, steps, guidance)
+                torch.cuda.synchronize()
+                row['inference_seconds'] = time.perf_counter() - started
+                row['peak_allocated_gib'] = torch.cuda.max_memory_allocated() / 1024**3
                 if output.size != original.size:
                     raise ValueError(f'unexpected output dimensions {output.size}')
                 image_path = args.output / 'images' / f'{review_id}.png'
@@ -281,7 +324,7 @@ def main() -> int:
                 output.save(image_path)
                 row['image'] = str(image_path.resolve())
                 row.update({k: '' if v is None else v for k, v in
-                            score_pair(original, reference, output, target, lpips_fn, stroke_mask).items()})
+                            score_pair(original, reference, output, target, lpips_fn, stroke_mask, region_mask).items()})
                 sheet = args.output / 'sheets' / f'{review_id}.jpg'
                 contact_sheet([original, reference, output] + ([target] if target else []),
                               'original | reference | output' + (' | target' if target else ''), sheet)

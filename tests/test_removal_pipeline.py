@@ -208,15 +208,22 @@ class RemovalPipelineTests(unittest.TestCase):
                 pass
             generator = SimpleNamespace(manual_seed=lambda seed: seed)
             torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True, empty_cache=Mock(),
-                                                         OutOfMemoryError=OOM), bfloat16="bf16",
+                                                         OutOfMemoryError=OOM, synchronize=Mock(),
+                                                         reset_peak_memory_stats=Mock(), max_memory_allocated=lambda: 1024**3), bfloat16="bf16",
                                     Generator=lambda **kwargs: generator, inference_mode=contextlib.nullcontext)
             pipe = Mock(side_effect=[SimpleNamespace(images=[source]), OOM()])
             pipe.to.return_value = pipe
             model = SimpleNamespace(from_pretrained=Mock(return_value=pipe))
+            perceptual = Mock()
+            perceptual.parameters.return_value = []
+            perceptual.to.return_value = perceptual
+            perceptual.eval.return_value = perceptual
             argv = ["benchmark.py", "--manifest", str(manifest), "--split", "external", "--baseline",
                     "--checkpoint", str(checkpoint), "--resolutions", "96", "--output", str(root / "results")]
-            with patch.dict(sys.modules, {"torch": torch, "diffusers": SimpleNamespace(Flux2KleinPipeline=model)}), \
-                    patch.object(sys, "argv", argv), patch.object(benchmark, "load_runtime_env"):
+            with patch.dict(sys.modules, {"torch": torch, "diffusers": SimpleNamespace(Flux2KleinPipeline=model),
+                                          'lpips': SimpleNamespace(LPIPS=Mock(return_value=perceptual))}), \
+                    patch.object(sys, "argv", argv), patch.object(benchmark, "load_runtime_env"), \
+                    patch.object(benchmark, 'score_pair', return_value=dict.fromkeys(benchmark.METRICS)):
                 self.assertEqual(benchmark.main(), 0)
             rows = review_benchmark.read_csv(root / "results/results.csv")
             self.assertEqual([row["status"] for row in rows], ["ok", "error"])

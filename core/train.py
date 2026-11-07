@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import math
 import os
 import re
 import signal
@@ -58,6 +60,8 @@ def config_paths(text: str) -> list[Path]:
             if not dataset.get(key):
                 raise SystemExit(f"two-input training requires {key}")
             paths.append(Path(dataset[key]))
+        if dataset.get('mask_path'):
+            paths.append(Path(dataset['mask_path']))
     for sample in process["sample"]["samples"]:
         if sample["prompt"] != PROMPT:
             raise SystemExit("preview prompt differs from training prompt")
@@ -105,6 +109,27 @@ def existing_checkpoints(output: Path = OUTPUT_DIR) -> list[Path]:
     if not output.is_dir():
         return []
     return sorted(output.glob("*.safetensors"))
+
+
+def validate_region_dataset(dataset: dict) -> Path:
+    """Fail on missing/stale masks instead of silently training uniform MSE."""
+    mask_dir = Path(dataset['mask_path'])
+    provenance = mask_dir.parent / 'mask_provenance.json'
+    records = json.loads(provenance.read_text(encoding='utf-8'))['records']
+    by_index = {r['index']: r for r in records if r['split'] == 'train'}
+    targets = list(Path(dataset['folder_path']).glob('*.png'))
+    if not targets or {p.stem for p in targets} != set(by_index):
+        raise ValueError('region mask provenance differs from prepared training indexes')
+    keys = {'folder_path': 'target_image', 'control_path_1': 'original', 'control_path_2': 'reference'}
+    for target in targets:
+        record = by_index[target.stem]
+        for key, source_key in keys.items():
+            path = Path(dataset[key]) / target.name
+            if hashlib.sha256(path.read_bytes()).hexdigest() != record['source_sha256'][source_key]:
+                raise ValueError(f'{target.stem}: stale mask provenance for {source_key}')
+        if hashlib.sha256((mask_dir / target.name).read_bytes()).hexdigest() != record['loss_mask_sha256']:
+            raise ValueError(f'{target.stem}: supervision mask changed; regenerate masks')
+    return provenance
 
 
 def parse_trainer_line(line: str) -> dict[str, int | float] | None:
@@ -183,6 +208,29 @@ def main() -> int:
         process_config["sample"]["sample_every"] = args.smoke_steps
         config_text = yaml.safe_dump(config, sort_keys=False)
     process_config = config["config"]["process"][0]
+    region_loss = config.pop('region_loss', None)
+    if region_loss is not None:
+        from patch_region_trainer import patched_source
+        strength = float(region_loss['strength'])
+        if not math.isfinite(strength) or strength < 0:
+            parser.error('region loss strength must be finite and nonnegative')
+        trainer_file = AITOOLKIT_DIR / 'extensions_built_in/sd_trainer/SDTrainer.py'
+        source = trainer_file.read_text(encoding='utf-8')
+        if patched_source(source) != source:
+            parser.error('install the region trainer patch first')
+        for dataset in process_config['datasets']:
+            if not dataset.get('mask_path') or dataset.get('mask_min_value', 0) != 0:
+                parser.error('region loss needs mask_path and mask_min_value=0')
+            images = list(Path(dataset['folder_path']).glob('*.png'))
+            if not images:
+                parser.error('region training folder has no PNG targets')
+            for image in images:
+                if not (Path(dataset['mask_path']) / image.name).is_file():
+                    parser.error(f'missing supervision mask: {image.name}')
+            provenance = validate_region_dataset(dataset)
+        if process_config['train'].get('loss_type', 'mse') != 'mse':
+            parser.error('region experiment requires MSE')
+        config_text = yaml.safe_dump(config, sort_keys=False)
     output_dir = Path(process_config["training_folder"]) / config["config"]["name"]
     numbers = config_numbers(config_text)
     require_ready(config_text)
@@ -205,14 +253,32 @@ def main() -> int:
         raise SystemExit(f"missing trainer python: {python}. Run core/setup.sh and use the klein env.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    config_path = args.config.resolve()
-    if args.smoke_steps is not None:
-        config_path = output_dir / "smoke_config.yaml"
-        config_path.write_text(config_text, encoding="utf-8")
+    config_path = output_dir / ('smoke_config.yaml' if args.smoke_steps is not None else 'resolved_config.yaml')
     log_path = output_dir / "train.log"
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    # Prevent a parent shell from silently enabling weighting on an old config.
+    env.pop('FLUX_REGION_STRENGTH', None)
+    if region_loss is not None:
+        env['FLUX_REGION_STRENGTH'] = str(strength)
+        env['PYTHONPATH'] = str(Path(__file__).resolve().parent) + os.pathsep + env.get('PYTHONPATH', '')
+        info = dict(region_loss=region_loss,
+                    trainer_sha256=hashlib.sha256(trainer_file.read_bytes()).hexdigest(),
+                    config_sha256=hashlib.sha256(config_text.encode()).hexdigest())
+        info['mask_provenance_sha256'] = hashlib.sha256(provenance.read_bytes()).hexdigest()
+        info_path = output_dir / 'experiment.json'
+        if checkpoints:
+            previous = json.loads(info_path.read_text(encoding='utf-8'))
+            for key in ('region_loss', 'trainer_sha256', 'mask_provenance_sha256', 'config_sha256'):
+                if previous.get(key) != info.get(key):
+                    raise SystemExit(f'resume experiment differs in {key}; choose a new run name')
+        info_path.write_text(json.dumps(info, indent=2), encoding='utf-8')
     command = [str(python), "run.py", str(config_path)]
+    if region_loss is not None:
+        env['FLUX_REGION_SEED'] = str(int(region_loss.get('seed', 42)))
+        env['PYTHONHASHSEED'] = env['FLUX_REGION_SEED']
+        command = [str(python), str(Path(__file__).with_name('run_region_trainer.py').resolve()), str(config_path)]
+    config_path.write_text(config_text, encoding='utf-8')
     print(" ".join(command))
     process = subprocess.Popen(
         command,
